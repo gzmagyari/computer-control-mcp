@@ -407,19 +407,42 @@ def _process_image_for_output(
     return buf.getvalue(), image_format
 
 
+def _force_activate_window(window):
+    """Force a window to the foreground. Works reliably on Windows."""
+    import ctypes
+    import time
+    try:
+        hwnd = window._hWnd  # pywinctl window handle
+
+        # Restore if minimized
+        if window.isMinimized:
+            window.restore()
+            time.sleep(0.1)
+
+        # Bring to top and set foreground
+        if sys.platform == "win32":
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            ctypes.windll.user32.BringWindowToTop(hwnd)
+        window.activate()  # fallback / non-Windows
+        time.sleep(0.3)  # wait for OS to update
+
+    except Exception as e:
+        log(f"Warning: Could not force-activate window: {e}")
+
+
 def _take_screenshot_as_array(
     title_pattern: str = None,
     use_regex: bool = False,
     threshold: int = 10,
+    activate: bool = False,
 ) -> Tuple[PILImage.Image, "np.ndarray", str, Optional[Any]]:
     """Take a screenshot and return as PIL Image + numpy array.
-
-    Non-intrusive: does NOT activate windows (suitable for diffing).
 
     Args:
         title_pattern: Window title pattern. None = full screen.
         use_regex: Regex mode for window matching.
         threshold: Fuzzy match threshold.
+        activate: If True, activate the matched window before capturing.
 
     Returns:
         (pil_image, numpy_array, key, window_obj_or_None)
@@ -441,6 +464,8 @@ def _take_screenshot_as_array(
             key = window_obj.title
 
     if window_obj:
+        if activate:
+            _force_activate_window(window_obj)
         screen_width, screen_height = pyautogui.size()
         pil_img = _mss_screenshot(region=(
             max(window_obj.left, 0),
@@ -738,28 +763,6 @@ def take_screenshot(
         window = _find_matching_window(windows, title_pattern, use_regex, threshold)
         window = window["window_obj"] if window else None
 
-        import ctypes
-        import time
-
-        def force_activate(window):
-            """Force a window to the foreground on Windows."""
-            try:
-                hwnd = window._hWnd  # pywinctl window handle
-
-                # Restore if minimized
-                if window.isMinimized:
-                    window.restore()
-                    time.sleep(0.1)
-
-                # Bring to top and set foreground
-                ctypes.windll.user32.SetForegroundWindow(hwnd)
-                ctypes.windll.user32.BringWindowToTop(hwnd)
-                window.activate()  # fallback
-                time.sleep(0.3)  # wait for OS to update
-
-            except Exception as e:
-                print(f"Warning: Could not force window: {e}", file=sys.stderr)
-
         # Take the screenshot
         if not window:
             log("No matching window found, taking screenshot of entire screen")
@@ -787,11 +790,8 @@ def take_screenshot(
                     else:
                         log("WGC capture failed, falling back to MSS")
                         # Fall back to MSS if WGC fails
-                        if sys.platform == "win32":
-                            force_activate(window)
-                        else:
-                            window.activate()
-                        pyautogui.sleep(0.5)  # Give Windows time to focus
+                        _force_activate_window(window)
+                        pyautogui.sleep(0.2)
 
                         screen_width, screen_height = pyautogui.size()
 
@@ -804,11 +804,8 @@ def take_screenshot(
                             )
                         )
                 else:
-                    if sys.platform == "win32":
-                        force_activate(window)
-                    else:
-                        window.activate()
-                    pyautogui.sleep(0.5)  # Give Windows time to focus
+                    _force_activate_window(window)
+                    pyautogui.sleep(0.2)
 
                     screen_width, screen_height = pyautogui.size()
 
@@ -824,10 +821,7 @@ def take_screenshot(
                 # Restore previously active window
                 if current_active_window and current_active_window != window:
                     try:
-                        if sys.platform == "win32":
-                            force_activate(current_active_window)
-                        else:
-                            current_active_window.activate()
+                        _force_activate_window(current_active_window)
                         pyautogui.sleep(0.2)
                     except Exception as e:
                         log(f"Error restoring previous window: {str(e)}")
@@ -1136,7 +1130,7 @@ def take_screenshot_with_ocr(
         color_mode: Color mode for saved file - "color" (default), "grayscale", or "bw". Only applies when save_to_downloads is True
 
     Returns:
-        Returns a list of UI elements as List[Tuple[List[List[int]], str, float]] where each tuple is [[4 corners of box], text, confidence], "content type image not supported" means preview isnt supported but Image object is there.
+        JSON array of detected text elements. Each element has: text, confidence, box (relative corners), abs_box (absolute screen corners), center_x/center_y (relative), abs_center_x/abs_center_y (absolute screen coordinates ready for click_screen).
     """
     try:
         all_windows = gw.getAllWindows()
@@ -1163,24 +1157,12 @@ def take_screenshot_with_ocr(
             log("No matching window found, taking screenshot of entire screen")
             screenshot = _mss_screenshot()
         else:
-            current_active_window = gw.getActiveWindow()
             log(f"Taking screenshot of window: {window.title}")
-            # Activate the window and wait for it to be fully in focus
             try:
-                window.activate()
-                pyautogui.sleep(0.5)  # Wait for 0.5 seconds to ensure window is active
+                _force_activate_window(window)
                 screenshot = _mss_screenshot(
                     region=(window.left, window.top, window.width, window.height)
                 )
-                # Restore the previously active window
-                if current_active_window:
-                    try:
-                        current_active_window.activate()
-                        pyautogui.sleep(
-                            0.2
-                        )  # Wait a bit to ensure previous window is restored
-                    except Exception as e:
-                        log(f"Error restoring previous window: {str(e)}")
             except Exception as e:
                 log(f"Error taking screenshot of window: {str(e)}")
                 return f"Error taking screenshot of window: {str(e)}"
@@ -1253,23 +1235,38 @@ def take_screenshot_with_ocr(
         if boxes is None or txts is None:
             return "No text found in screenshot."
 
-        zipped_results = list(zip(boxes, txts, scores))
-        zipped_results = [
-            (
-                box.tolist(),
-                text,
-                float(score),
-            )  # convert np.array -> list, ensure score is float
-            for box, text, score in zipped_results
-        ]
-        log(f"Found {len(zipped_results)} text items in OCR result.")
-        # Use safe formatting for OCR results to prevent Unicode encoding errors
-        log(f"First 5 items: {_safe_format_ocr_results(zipped_results[:5])}")
-        return (
-            ",\n".join([str(item) for item in zipped_results])
-            if zipped_results
-            else "No text found"
-        )
+        # Calculate window offset for absolute coordinates
+        offset_x = 0
+        offset_y = 0
+        if window:
+            offset_x = max(window.left, 0)
+            offset_y = max(window.top, 0)
+
+        results = []
+        for box, text, score in zip(boxes, txts, scores):
+            box_list = box.tolist()
+            # Relative coordinates (within the captured region)
+            rel_center_x = int(sum(p[0] for p in box_list) / 4)
+            rel_center_y = int(sum(p[1] for p in box_list) / 4)
+            # Absolute screen coordinates (ready for click_screen)
+            abs_center_x = rel_center_x + offset_x
+            abs_center_y = rel_center_y + offset_y
+            abs_box = [[int(p[0] + offset_x), int(p[1] + offset_y)] for p in box_list]
+
+            results.append({
+                "text": text,
+                "confidence": round(float(score), 4),
+                "box": box_list,
+                "abs_box": abs_box,
+                "center_x": rel_center_x,
+                "center_y": rel_center_y,
+                "abs_center_x": abs_center_x,
+                "abs_center_y": abs_center_y,
+            })
+
+        log(f"Found {len(results)} text items in OCR result.")
+        log(f"First 5 items: {_safe_format_ocr_results([(r['box'], r['text'], r['confidence']) for r in results[:5]])}")
+        return json.dumps(results) if results else "No text found"
 
     except Exception as e:
         log(f"Error in screenshot or getting UI elements: {str(e)}")
@@ -1520,7 +1517,7 @@ def activate_window(
         matched_window = matched_window_dict["window_obj"]
 
         # Activate the window
-        matched_window.activate()
+        _force_activate_window(matched_window)
 
         return f"Successfully activated window: '{matched_window.title}'"
     except Exception as e:
@@ -1880,11 +1877,12 @@ def find_text(
         match_threshold: Minimum fuzzy match score (0-100) for text matching. Default 70.
 
     Returns:
-        JSON with all matches: {"matches": [{"text", "score", "center_x", "center_y", "left", "top", "width", "height"}, ...], "total": N}
+        JSON with all matches: {"matches": [{"text", "score", "center_x", "center_y", "abs_center_x", "abs_center_y", "left", "top", "width", "height"}, ...], "total": N}
+        center_x/center_y are relative to the captured region. abs_center_x/abs_center_y are absolute screen coordinates ready for click_screen.
     """
     try:
         pil_img, np_array, key, window_obj = _take_screenshot_as_array(
-            title_pattern, use_regex, threshold
+            title_pattern, use_regex, threshold, activate=True
         )
 
         offset_x = 0
@@ -1918,22 +1916,28 @@ def find_text(
                 combined_score = round(fuzzy_score * 0.7 + (length_ratio * 100) * 0.3)
 
                 box = boxes[i]
-                center_x = int(sum(p[0] for p in box) / 4 + offset_x)
-                center_y = int(sum(p[1] for p in box) / 4 + offset_y)
-                left = int(min(p[0] for p in box) + offset_x)
-                top = int(min(p[1] for p in box) + offset_y)
-                right = int(max(p[0] for p in box) + offset_x)
-                bottom = int(max(p[1] for p in box) + offset_y)
+                # Relative coordinates (within the captured region)
+                rel_center_x = int(sum(p[0] for p in box) / 4)
+                rel_center_y = int(sum(p[1] for p in box) / 4)
+                rel_left = int(min(p[0] for p in box))
+                rel_top = int(min(p[1] for p in box))
+                rel_right = int(max(p[0] for p in box))
+                rel_bottom = int(max(p[1] for p in box))
+                # Absolute screen coordinates (ready for click_screen)
+                abs_center_x = rel_center_x + offset_x
+                abs_center_y = rel_center_y + offset_y
 
                 matches.append({
                     "text": ocr_text,
                     "score": combined_score,
-                    "center_x": center_x,
-                    "center_y": center_y,
-                    "left": left,
-                    "top": top,
-                    "width": right - left,
-                    "height": bottom - top,
+                    "center_x": rel_center_x,
+                    "center_y": rel_center_y,
+                    "abs_center_x": abs_center_x,
+                    "abs_center_y": abs_center_y,
+                    "left": rel_left,
+                    "top": rel_top,
+                    "width": rel_right - rel_left,
+                    "height": rel_bottom - rel_top,
                 })
 
         # Sort by score descending, then top-to-bottom, then left-to-right
@@ -1976,7 +1980,7 @@ def click_text(
     """
     try:
         pil_img, np_array, key, window_obj = _take_screenshot_as_array(
-            title_pattern, use_regex, threshold
+            title_pattern, use_regex, threshold, activate=True
         )
 
         # Determine window offset for absolute coordinates
