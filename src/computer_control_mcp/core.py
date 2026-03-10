@@ -407,9 +407,48 @@ def _process_image_for_output(
     return buf.getvalue(), image_format
 
 
-def _force_activate_window(window):
-    """Force a window to the foreground. Works reliably on Windows."""
+def _is_window_elevated(hwnd) -> bool:
+    """Check if a window belongs to an elevated (admin) process. Windows-only."""
+    if sys.platform != "win32":
+        return False
     import ctypes
+    import ctypes.wintypes
+    try:
+        pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            token = ctypes.wintypes.HANDLE()
+            if not ctypes.windll.advapi32.OpenProcessToken(handle, 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+                return False
+            try:
+                class TOKEN_ELEVATION(ctypes.Structure):
+                    _fields_ = [("TokenIsElevated", ctypes.c_ulong)]
+                elevation = TOKEN_ELEVATION()
+                size = ctypes.c_ulong()
+                ctypes.windll.advapi32.GetTokenInformation(
+                    token.value, 20, ctypes.byref(elevation),
+                    ctypes.sizeof(elevation), ctypes.byref(size)
+                )
+                return bool(elevation.TokenIsElevated)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(token)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def _force_activate_window(window):
+    """Force a window to the foreground. Works reliably on Windows.
+
+    Returns:
+        str or None: Warning message if activation failed (e.g. elevated window), None on success.
+    """
+    import ctypes
+    import ctypes.wintypes
     import time
     try:
         hwnd = window._hWnd  # pywinctl window handle
@@ -426,8 +465,37 @@ def _force_activate_window(window):
         window.activate()  # fallback / non-Windows
         time.sleep(0.3)  # wait for OS to update
 
+        # Verify input still works after activation (Windows UIPI can block input
+        # to elevated windows even when SetForegroundWindow reports success)
+        if sys.platform == "win32":
+            import pyautogui as _pag
+            pt = ctypes.wintypes.POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            orig_x, orig_y = pt.x, pt.y
+            # Try a small relative move
+            test_x = orig_x + (1 if orig_x < 1919 else -1)
+            _pag.moveTo(test_x, orig_y)
+            time.sleep(0.05)
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            input_works = (pt.x == test_x)
+            # Restore original position
+            if input_works:
+                _pag.moveTo(orig_x, orig_y)
+            if not input_works and _is_window_elevated(hwnd):
+                msg = (
+                    f"WARNING: Window '{window.title}' is running as Administrator. "
+                    f"Mouse/keyboard input to elevated windows is blocked by Windows (UIPI). "
+                    f"Run the MCP server as Administrator to control this window."
+                )
+                log(msg)
+                return msg
+            elif not input_works:
+                log(f"Warning: Input may not work after activating '{window.title}'")
+        return None
+
     except Exception as e:
         log(f"Warning: Could not force-activate window: {e}")
+        return None
 
 
 def _take_screenshot_as_array(
@@ -463,9 +531,10 @@ def _take_screenshot_as_array(
             window_obj = matched["window_obj"]
             key = window_obj.title
 
+    activation_warning = None
     if window_obj:
         if activate:
-            _force_activate_window(window_obj)
+            activation_warning = _force_activate_window(window_obj)
         screen_width, screen_height = pyautogui.size()
         pil_img = _mss_screenshot(region=(
             max(window_obj.left, 0),
@@ -477,7 +546,7 @@ def _take_screenshot_as_array(
         pil_img = _mss_screenshot()
 
     np_array = np.array(pil_img)
-    return pil_img, np_array, key, window_obj
+    return pil_img, np_array, key, window_obj, activation_warning
 
 
 def _compute_diff_regions(
@@ -1517,7 +1586,9 @@ def activate_window(
         matched_window = matched_window_dict["window_obj"]
 
         # Activate the window
-        _force_activate_window(matched_window)
+        warning = _force_activate_window(matched_window)
+        if warning:
+            return warning
 
         return f"Successfully activated window: '{matched_window.title}'"
     except Exception as e:
@@ -1647,7 +1718,7 @@ def check_screen_changed(
         JSON: {"changed": bool, "change_percent": float, "regions": [{"left", "top", "width", "height"}, ...], "first_check": bool}
     """
     try:
-        pil_img, new_array, key, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+        pil_img, new_array, key, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
 
         if key not in _last_screenshots:
             _last_screenshots[key] = new_array
@@ -1707,7 +1778,7 @@ def check_screen_changed_with_images(
         List of [JSON summary text, Image region 1, Image region 2, ...].
     """
     try:
-        pil_img, new_array, key, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+        pil_img, new_array, key, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
 
         if key not in _last_screenshots:
             _last_screenshots[key] = new_array
@@ -1794,7 +1865,7 @@ async def wait_for_screen_change(
         stable_ms = max(stable_ms, 0)
 
         # Take baseline
-        _, baseline, key, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+        _, baseline, key, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
         start_time = time.monotonic()
 
         # Main polling loop: wait for change
@@ -1809,7 +1880,7 @@ async def wait_for_screen_change(
 
             await asyncio.sleep(poll_interval_ms / 1000.0)
 
-            _, current, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+            _, current, _, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
             changed, change_pct, regions = _compute_diff_regions(
                 baseline, current, pixel_threshold, min_region_area
             )
@@ -1830,7 +1901,7 @@ async def wait_for_screen_change(
 
                     await asyncio.sleep(poll_interval_ms / 1000.0)
 
-                    _, new_check, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+                    _, new_check, _, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
                     still_changing, _, _ = _compute_diff_regions(
                         last_stable, new_check, pixel_threshold, min_region_area
                     )
@@ -1881,7 +1952,7 @@ def find_text(
         center_x/center_y are relative to the captured region. abs_center_x/abs_center_y are absolute screen coordinates ready for click_screen.
     """
     try:
-        pil_img, np_array, key, window_obj = _take_screenshot_as_array(
+        pil_img, np_array, key, window_obj, activation_warning = _take_screenshot_as_array(
             title_pattern, use_regex, threshold, activate=True
         )
 
@@ -1943,7 +2014,10 @@ def find_text(
         # Sort by score descending, then top-to-bottom, then left-to-right
         matches.sort(key=lambda m: (-m["score"], m["center_y"], m["center_x"]))
 
-        return json.dumps({"matches": matches, "total": len(matches)})
+        result = {"matches": matches, "total": len(matches)}
+        if activation_warning:
+            result["warning"] = activation_warning
+        return json.dumps(result)
 
     except Exception as e:
         log(f"Error in find_text: {str(e)}")
@@ -1979,9 +2053,11 @@ def click_text(
         Success message with matched text, score, and click coordinates, or error message.
     """
     try:
-        pil_img, np_array, key, window_obj = _take_screenshot_as_array(
+        pil_img, np_array, key, window_obj, activation_warning = _take_screenshot_as_array(
             title_pattern, use_regex, threshold, activate=True
         )
+        if activation_warning:
+            return activation_warning
 
         # Determine window offset for absolute coordinates
         offset_x = 0
