@@ -62,6 +62,14 @@ OCR_REGION_OVERLAP = 0.15         # 15% overlap between adjacent tiles
 OCR_MAX_WORKERS = 4               # max parallel OCR threads (controls batching)
 OCR_IOU_DEDUP_THRESHOLD = 0.40    # IoU above this = duplicate
 OCR_MIN_IMAGE_AREA = 800 * 600    # only split images larger than this
+
+# Max screenshot dimensions for agent consumption.
+# Claude API silently downscales images (max 1568px long edge, ~1600 tokens).
+# Claude Code further downscales to ~960x540. Pre-scaling to this size ensures
+# the model's coordinate estimates match the image pixels, enabling accurate
+# coordinate mapping back to real screen coordinates via the returned scale factor.
+AGENT_MAX_IMAGE_WIDTH = 960
+AGENT_MAX_IMAGE_HEIGHT = 540
 # Examples of grid vs max_workers for accuracy/speed tradeoffs:
 #   (2,2) grid, 4 workers  = 4 regions,  1 batch  — fast, good accuracy
 #   (3,3) grid, 4 workers  = 9 regions,  3 batches — slower, better accuracy
@@ -349,6 +357,39 @@ def save_image_to_downloads(
 
     log(f"Saved image to {filepath}")
     return str(filepath.absolute()), img_bytes
+
+
+def _prescale_for_agent(
+    screenshot: PILImage.Image,
+    max_width: int = AGENT_MAX_IMAGE_WIDTH,
+    max_height: int = AGENT_MAX_IMAGE_HEIGHT,
+) -> Tuple[PILImage.Image, float]:
+    """Scale image down to fit within max dimensions for agent consumption.
+
+    Returns:
+        Tuple of (scaled_image, scale_factor) where scale_factor is the multiplier
+        to convert coordinates from the scaled image back to original screen coordinates.
+        e.g. if scale_factor is 2.0, multiply image coords by 2.0 to get screen coords.
+        If no scaling needed, returns (original_image, 1.0).
+    """
+    orig_w, orig_h = screenshot.size
+
+    # Calculate scale factor to fit within max dimensions
+    scale_x = max_width / orig_w if orig_w > max_width else 1.0
+    scale_y = max_height / orig_h if orig_h > max_height else 1.0
+    scale = min(scale_x, scale_y)
+
+    if scale >= 1.0:
+        return screenshot, 1.0
+
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+    scaled = screenshot.resize((new_w, new_h), PILImage.LANCZOS)
+
+    # scale_factor: multiply scaled coords by this to get original coords
+    scale_factor = orig_w / new_w
+
+    return scaled, scale_factor
 
 
 def _process_image_for_output(
@@ -812,7 +853,7 @@ def take_screenshot(
         color_mode: Color mode - "color" (default), "grayscale" (removes color, ~50%% smaller for PNG, significant for webp/jpeg), or "bw" (black and white, very small, best for text-heavy screens)
 
     Returns:
-        Returns a single screenshot as MCP Image object. "content type image not supported" means preview isnt supported but Image object is there and returned successfully.
+        Returns a list of [scale_info_text, MCP Image]. The image is prescaled to max 960x540 for accurate agent coordinate estimation. The scale_info_text contains the scale factor to convert image coordinates back to real screen coordinates. "content type image not supported" means preview isnt supported but Image object is there and returned successfully.
     """
     try:
         all_windows = gw.getAllWindows()
@@ -898,6 +939,13 @@ def take_screenshot(
                 log(f"Error taking screenshot of window: {str(e)}")
                 screenshot = _mss_screenshot()  # fallback to full screen
 
+        # Prescale for agent consumption (Claude API downscales images silently,
+        # so we prescale to a known size and return the scale factor)
+        orig_w, orig_h = screenshot.size
+        screenshot, scale_factor = _prescale_for_agent(screenshot)
+        scaled_w, scaled_h = screenshot.size
+        log(f"Prescaled screenshot: {orig_w}x{orig_h} -> {scaled_w}x{scaled_h} (scale_factor={scale_factor:.4f})")
+
         # Process image with format/quality/color optimizations
         try:
             img_bytes, fmt = _process_image_for_output(
@@ -925,7 +973,16 @@ def take_screenshot(
                 f.write(img_bytes)
             log(f"Saved screenshot to {downloads_path}")
 
-        return image  # MCP Image object
+        # Return both scale info and image so agents can map coordinates accurately
+        scale_info = (
+            f"Screenshot captured: {scaled_w}x{scaled_h} (prescaled from {orig_w}x{orig_h}). "
+            f"IMPORTANT: This image has been prescaled by factor {scale_factor:.4f}x. "
+            f"To convert any coordinates you estimate from this image to real screen coordinates, "
+            f"multiply both x and y by {scale_factor:.4f}. "
+            f"Example: if you see a button at (480, 270) in this image, the real screen coordinate is "
+            f"({int(480 * scale_factor)}, {int(270 * scale_factor)})."
+        )
+        return [scale_info, image]
 
     except Exception as e:
         log(f"Error in screenshot or getting UI elements: {str(e)}")
@@ -1311,21 +1368,26 @@ def take_screenshot_with_ocr(
             offset_x = max(window.left, 0)
             offset_y = max(window.top, 0)
 
+        # Scale factor to map OCR coordinates (from resized image) back to original image size
+        ocr_scale = 100.0 / scale_percent_for_ocr
+
         results = []
         for box, text, score in zip(boxes, txts, scores):
             box_list = box.tolist()
-            # Relative coordinates (within the captured region)
-            rel_center_x = int(sum(p[0] for p in box_list) / 4)
-            rel_center_y = int(sum(p[1] for p in box_list) / 4)
+            # Scale box coordinates back to original image size
+            scaled_box = [[p[0] * ocr_scale, p[1] * ocr_scale] for p in box_list]
+            # Relative coordinates (within the captured region, at original size)
+            rel_center_x = int(sum(p[0] for p in scaled_box) / 4)
+            rel_center_y = int(sum(p[1] for p in scaled_box) / 4)
             # Absolute screen coordinates (ready for click_screen)
             abs_center_x = rel_center_x + offset_x
             abs_center_y = rel_center_y + offset_y
-            abs_box = [[int(p[0] + offset_x), int(p[1] + offset_y)] for p in box_list]
+            abs_box = [[int(p[0] + offset_x), int(p[1] + offset_y)] for p in scaled_box]
 
             results.append({
                 "text": text,
                 "confidence": round(float(score), 4),
-                "box": box_list,
+                "box": scaled_box,
                 "abs_box": abs_box,
                 "center_x": rel_center_x,
                 "center_y": rel_center_y,
