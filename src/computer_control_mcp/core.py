@@ -40,6 +40,7 @@ import numpy as np
 from rapidocr import RapidOCR, LangRec, ModelType, OCRVersion
 
 from pydantic import BaseModel
+from computer_control_mcp.ui_automation import get_ui_elements
 
 BaseModel.model_config = {"arbitrary_types_allowed": True}
 
@@ -53,8 +54,10 @@ engine = RapidOCR(
     }
 )
 
-# Storage for last screenshots, keyed by window title or "full_screen"
+# Storage for last screenshots/OCR/UI automation, keyed by window title or "full_screen"
 _last_screenshots: Dict[str, Any] = {}
+_last_ocr_results: Dict[str, Any] = {}
+_last_ui_elements: Dict[str, Any] = {}
 
 # Region-splitting OCR configuration (all configurable)
 OCR_REGION_GRID = (4, 3)          # (cols, rows) — total regions = cols * rows
@@ -544,7 +547,8 @@ def _take_screenshot_as_array(
     use_regex: bool = False,
     threshold: int = 10,
     activate: bool = False,
-) -> Tuple[PILImage.Image, "np.ndarray", str, Optional[Any]]:
+    region: list = None,
+):
     """Take a screenshot and return as PIL Image + numpy array.
 
     Args:
@@ -552,13 +556,18 @@ def _take_screenshot_as_array(
         use_regex: Regex mode for window matching.
         threshold: Fuzzy match threshold.
         activate: If True, activate the matched window before capturing.
+        region: Optional [x, y, width, height] in absolute screen coordinates.
+                If provided, captures only this region. title_pattern can still
+                be used to activate a window before capturing the region.
 
     Returns:
-        (pil_image, numpy_array, key, window_obj_or_None)
-        key is window title or "full_screen", used for _last_screenshots lookup.
+        (pil_image, numpy_array, key, window_obj_or_None, activation_warning, region_offset)
+        key is window title, region key, or "full_screen", used for _last_screenshots lookup.
+        region_offset is (offset_x, offset_y) for region captures, None otherwise.
     """
     window_obj = None
     key = "full_screen"
+    region_offset = None
 
     if title_pattern:
         all_windows = gw.getAllWindows()
@@ -573,9 +582,22 @@ def _take_screenshot_as_array(
             key = window_obj.title
 
     activation_warning = None
-    if window_obj:
-        if activate:
-            activation_warning = _force_activate_window(window_obj)
+    if window_obj and activate:
+        activation_warning = _force_activate_window(window_obj)
+
+    if region:
+        # Region capture — overrides window capture area
+        screen_width, screen_height = pyautogui.size()
+        rx, ry, rw, rh = int(region[0]), int(region[1]), int(region[2]), int(region[3])
+        rx = max(rx, 0)
+        ry = max(ry, 0)
+        rw = min(rw, screen_width - rx)
+        rh = min(rh, screen_height - ry)
+        pil_img = _mss_screenshot(region=(rx, ry, rw, rh))
+        key = f"region_{rx}_{ry}_{rw}_{rh}"
+        region_offset = (rx, ry)
+        window_obj = None  # Clear so callers use region_offset for offsets
+    elif window_obj:
         screen_width, screen_height = pyautogui.size()
         pil_img = _mss_screenshot(region=(
             max(window_obj.left, 0),
@@ -587,7 +609,7 @@ def _take_screenshot_as_array(
         pil_img = _mss_screenshot()
 
     np_array = np.array(pil_img)
-    return pil_img, np_array, key, window_obj, activation_warning
+    return pil_img, np_array, key, window_obj, activation_warning, region_offset
 
 
 def _compute_diff_regions(
@@ -837,6 +859,7 @@ def take_screenshot(
     image_format: str = "png",
     quality: int = 80,
     color_mode: str = "color",
+    region: list = None,
 ) -> Image:
     """
     Get screenshot Image as MCP Image object. If no title pattern is provided, get screenshot of entire screen and all text on the screen.
@@ -873,8 +896,22 @@ def take_screenshot(
         window = _find_matching_window(windows, title_pattern, use_regex, threshold)
         window = window["window_obj"] if window else None
 
+        # Activate window if matched (even if region is provided)
+        if window and region:
+            _force_activate_window(window)
+            pyautogui.sleep(0.2)
+
         # Take the screenshot
-        if not window:
+        if region:
+            # Region capture overrides window capture area
+            screen_width, screen_height = pyautogui.size()
+            rx, ry, rw, rh = int(region[0]), int(region[1]), int(region[2]), int(region[3])
+            rx = max(rx, 0)
+            ry = max(ry, 0)
+            rw = min(rw, screen_width - rx)
+            rh = min(rh, screen_height - ry)
+            screenshot = _mss_screenshot(region=(rx, ry, rw, rh))
+        elif not window:
             log("No matching window found, taking screenshot of entire screen")
             screenshot = _mss_screenshot()
         else:
@@ -1241,6 +1278,7 @@ def take_screenshot_with_ocr(
     image_format: str = "png",
     quality: int = 80,
     color_mode: str = "color",
+    region: list = None,
 ) -> str:
     """
     Get OCR text from screenshot with absolute coordinates as JSON string of List[Tuple[List[List[int]], str, float]] (returned after adding the window offset from true (0, 0) of screen to the OCR coordinates, so clicking is on-point. Recommended to click in the middle of OCR Box) and using confidence from window with the specified title pattern. If no title pattern is provided, get screenshot of entire screen and all text on the screen. Know that OCR takes around 20 seconds on an mid-spec pc at 1080p resolution.
@@ -1276,16 +1314,26 @@ def take_screenshot_with_ocr(
         window = _find_matching_window(windows, title_pattern, use_regex, threshold)
         window = window["window_obj"] if window else None
 
-        # Store the currently active window
+        # Activate window if matched (even if region is provided)
+        if window:
+            _force_activate_window(window)
+            pyautogui.sleep(0.2)
 
         # Take the screenshot
-        if not window:
+        if region:
+            screen_width, screen_height = pyautogui.size()
+            rx, ry, rw, rh = int(region[0]), int(region[1]), int(region[2]), int(region[3])
+            rx = max(rx, 0)
+            ry = max(ry, 0)
+            rw = min(rw, screen_width - rx)
+            rh = min(rh, screen_height - ry)
+            screenshot = _mss_screenshot(region=(rx, ry, rw, rh))
+        elif not window:
             log("No matching window found, taking screenshot of entire screen")
             screenshot = _mss_screenshot()
         else:
             log(f"Taking screenshot of window: {window.title}")
             try:
-                _force_activate_window(window)
                 screenshot = _mss_screenshot(
                     region=(window.left, window.top, window.width, window.height)
                 )
@@ -1351,8 +1399,8 @@ def take_screenshot_with_ocr(
         # save resized image to pwd
         # cv2.imwrite("resized_img.png", resized_img)
 
-        # Use region-splitting OCR for full-screen captures
-        if not window:
+        # Use region-splitting OCR for full-screen captures (not for window/region)
+        if not window and not region:
             boxes, txts, scores = _ocr_with_regions(resized_img)
         else:
             output = engine(resized_img)
@@ -1361,12 +1409,15 @@ def take_screenshot_with_ocr(
         if boxes is None or txts is None:
             return "No text found in screenshot."
 
-        # Calculate window offset for absolute coordinates
-        offset_x = 0
-        offset_y = 0
-        if window:
+        # Calculate offset for absolute coordinates
+        if region:
+            offset_x = int(region[0])
+            offset_y = int(region[1])
+        elif window:
             offset_x = max(window.left, 0)
             offset_y = max(window.top, 0)
+        else:
+            offset_x, offset_y = 0, 0
 
         # Scale factor to map OCR coordinates (from resized image) back to original image size
         ocr_scale = 100.0 / scale_percent_for_ocr
@@ -1416,6 +1467,169 @@ def move_mouse(x: int, y: int) -> str:
         return f"Successfully moved mouse to coordinates ({x}, {y})"
     except Exception as e:
         return f"Error moving mouse to coordinates ({x}, {y}): {str(e)}"
+
+
+@mcp.tool()
+def get_mouse_position() -> str:
+    """Get the current mouse pointer coordinates on screen."""
+    try:
+        x, y = pyautogui.position()
+        return f"Mouse position: ({x}, {y})"
+    except Exception as e:
+        return f"Error getting mouse position: {str(e)}"
+
+
+@mcp.tool()
+def get_cursor_position() -> str:
+    """Get the text cursor (caret) position on screen.
+
+    Returns the screen coordinates of the text input caret/cursor if available.
+    This is different from the mouse pointer - it's where typed text would appear.
+    Windows only. Returns unavailable message on other platforms or if no caret is active.
+    """
+    if sys.platform != "win32":
+        return "Cursor position detection is only supported on Windows."
+
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.wintypes.DWORD),
+                ("flags", ctypes.wintypes.DWORD),
+                ("hwndActive", ctypes.wintypes.HWND),
+                ("hwndFocus", ctypes.wintypes.HWND),
+                ("hwndCapture", ctypes.wintypes.HWND),
+                ("hwndMenuOwner", ctypes.wintypes.HWND),
+                ("hwndMoveSize", ctypes.wintypes.HWND),
+                ("hwndCaret", ctypes.wintypes.HWND),
+                ("rcCaret", ctypes.wintypes.RECT),
+            ]
+
+        gui_info = GUITHREADINFO()
+        gui_info.cbSize = ctypes.sizeof(GUITHREADINFO)
+
+        if not ctypes.windll.user32.GetGUIThreadInfo(0, ctypes.byref(gui_info)):
+            return "No active caret found. The focused application may not have a text input field active."
+
+        if not gui_info.hwndCaret:
+            return "No active caret found. The focused application may not have a text input field active."
+
+        # Convert caret client coordinates to screen coordinates
+        point = ctypes.wintypes.POINT(gui_info.rcCaret.left, gui_info.rcCaret.top)
+        ctypes.windll.user32.ClientToScreen(gui_info.hwndCaret, ctypes.byref(point))
+
+        return f"Cursor (caret) position: ({point.x}, {point.y})"
+    except Exception as e:
+        return f"Error getting cursor position: {str(e)}"
+
+
+@mcp.tool()
+def capture_region_around(
+    x: int,
+    y: int,
+    radius: int = 150,
+    mark_center: bool = False,
+    marker_radius: int = 15,
+    image_format: str = "png",
+    quality: int = 80,
+    color_mode: str = "color",
+) -> list:
+    """Capture a screen region around the specified coordinates.
+
+    Captures a square region of size 2*radius centered on (x, y).
+    Optionally draws a red circle marker at the exact coordinates to help
+    verify if the position is correct before clicking.
+
+    Useful for AI agent coordinate verification:
+    1. Agent estimates coordinates from a full screenshot
+    2. Calls this tool with mark_center=True to see a zoomed-in view with marker
+    3. Adjusts coordinates if marker is off-target
+    4. Repeats until marker is on the desired element
+    5. Clicks the verified coordinates
+
+    Args:
+        x: Center X coordinate (absolute screen coordinates)
+        y: Center Y coordinate (absolute screen coordinates)
+        radius: Half-size of capture region in pixels (default 150, captures 300x300 area)
+        mark_center: If True, draw a red circle at (x, y) on the captured image
+        marker_radius: Radius of the red circle marker in screen pixels (default 15)
+        image_format: Output format - "png", "webp", or "jpeg"
+        quality: Compression quality 1-100 for webp/jpeg
+        color_mode: "color", "grayscale", or "bw"
+
+    Returns:
+        [info_text, Image] - info text includes coordinate mapping details
+    """
+    try:
+        screen_width, screen_height = pyautogui.size()
+
+        # Calculate capture region, clamped to screen bounds
+        left = max(x - radius, 0)
+        top = max(y - radius, 0)
+        right = min(x + radius, screen_width)
+        bottom = min(y + radius, screen_height)
+        width = right - left
+        height = bottom - top
+
+        if width <= 0 or height <= 0:
+            return f"Invalid region: coordinates ({x}, {y}) with radius {radius} result in empty capture area."
+
+        # Capture via _mss_screenshot
+        screenshot = _mss_screenshot(region=(left, top, width, height))
+
+        # Draw red circle marker if requested
+        if mark_center:
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(screenshot)
+            # Position of (x, y) relative to the captured region
+            marker_x = x - left
+            marker_y = y - top
+            # Draw circle outline (3px thick for visibility)
+            for offset in range(3):
+                r = marker_radius + offset
+                draw.ellipse(
+                    [marker_x - r, marker_y - r, marker_x + r, marker_y + r],
+                    outline="red",
+                )
+            # Draw small filled center dot
+            draw.ellipse(
+                [marker_x - 3, marker_y - 3, marker_x + 3, marker_y + 3],
+                fill="red",
+            )
+
+        # Prescale for agent consumption
+        orig_w, orig_h = screenshot.size
+        screenshot, scale_factor = _prescale_for_agent(screenshot)
+        scaled_w, scaled_h = screenshot.size
+
+        # Process image format/quality/color
+        img_bytes, fmt = _process_image_for_output(
+            screenshot,
+            image_format=image_format,
+            quality=quality,
+            color_mode=color_mode,
+        )
+
+        image = Image(data=img_bytes, format=fmt)
+
+        info = (
+            f"Captured {orig_w}x{orig_h} region around ({x}, {y}) "
+            f"(screen area: [{left}, {top}] to [{right}, {bottom}]). "
+            f"Prescaled to {scaled_w}x{scaled_h} (factor {scale_factor:.4f}x)."
+        )
+        if mark_center:
+            info += f" Red circle marker drawn at ({x}, {y})."
+
+        return [info, image]
+
+    except Exception as e:
+        log(f"Error in capture_region_around: {str(e)}")
+        import traceback
+        stack_trace = traceback.format_exc()
+        log(f"Stack trace:\n{stack_trace}")
+        return f"Error capturing region around ({x}, {y}): {str(e)}"
 
 
 @mcp.tool()
@@ -1764,6 +1978,7 @@ def check_screen_changed(
     threshold: int = 10,
     pixel_threshold: int = 30,
     min_region_area: int = 100,
+    region: list = None,
 ) -> str:
     """Compare current screen against last stored screenshot. Returns lightweight JSON with change info, no images.
     Much faster than taking a full screenshot — use this to check if something changed before deciding to take a screenshot.
@@ -1780,7 +1995,7 @@ def check_screen_changed(
         JSON: {"changed": bool, "change_percent": float, "regions": [{"left", "top", "width", "height"}, ...], "first_check": bool}
     """
     try:
-        pil_img, new_array, key, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+        pil_img, new_array, key, _, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold, region=region)
 
         if key not in _last_screenshots:
             _last_screenshots[key] = new_array
@@ -1820,6 +2035,7 @@ def check_screen_changed_with_images(
     image_format: str = "png",
     quality: int = 80,
     color_mode: str = "color",
+    region: list = None,
 ) -> list:
     """Compare current screen against last stored screenshot. Returns JSON summary + cropped images of changed regions.
     Use when you need to see what changed. For just checking if something changed, use check_screen_changed instead.
@@ -1840,7 +2056,7 @@ def check_screen_changed_with_images(
         List of [JSON summary text, Image region 1, Image region 2, ...].
     """
     try:
-        pil_img, new_array, key, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+        pil_img, new_array, key, _, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold, region=region)
 
         if key not in _last_screenshots:
             _last_screenshots[key] = new_array
@@ -1903,6 +2119,7 @@ async def wait_for_screen_change(
     stable_ms: int = 500,
     pixel_threshold: int = 30,
     min_region_area: int = 100,
+    region: list = None,
 ) -> str:
     """Wait until the screen changes, polling internally. Eliminates the need for the agent to poll with repeated screenshots.
     After detecting a change, waits for the screen to stabilize (stop changing) before returning.
@@ -1927,7 +2144,7 @@ async def wait_for_screen_change(
         stable_ms = max(stable_ms, 0)
 
         # Take baseline
-        _, baseline, key, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+        _, baseline, key, _, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold, region=region)
         start_time = time.monotonic()
 
         # Main polling loop: wait for change
@@ -1942,7 +2159,7 @@ async def wait_for_screen_change(
 
             await asyncio.sleep(poll_interval_ms / 1000.0)
 
-            _, current, _, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+            _, current, _, _, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold, region=region)
             changed, change_pct, regions = _compute_diff_regions(
                 baseline, current, pixel_threshold, min_region_area
             )
@@ -1963,7 +2180,7 @@ async def wait_for_screen_change(
 
                     await asyncio.sleep(poll_interval_ms / 1000.0)
 
-                    _, new_check, _, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold)
+                    _, new_check, _, _, _, _ = _take_screenshot_as_array(title_pattern, use_regex, threshold, region=region)
                     still_changing, _, _ = _compute_diff_regions(
                         last_stable, new_check, pixel_threshold, min_region_area
                     )
@@ -1997,6 +2214,7 @@ def find_text(
     use_regex: bool = False,
     threshold: int = 10,
     match_threshold: int = 70,
+    region: list = None,
 ) -> str:
     """Find all occurrences of text on screen via OCR. Returns matches with absolute screen coordinates.
     Use this to locate text before clicking, especially when multiple matches may exist.
@@ -2014,20 +2232,22 @@ def find_text(
         center_x/center_y are relative to the captured region. abs_center_x/abs_center_y are absolute screen coordinates ready for click_screen.
     """
     try:
-        pil_img, np_array, key, window_obj, activation_warning = _take_screenshot_as_array(
-            title_pattern, use_regex, threshold, activate=True
+        pil_img, np_array, key, window_obj, activation_warning, region_offset = _take_screenshot_as_array(
+            title_pattern, use_regex, threshold, activate=True, region=region
         )
 
-        offset_x = 0
-        offset_y = 0
-        if window_obj:
+        if region_offset:
+            offset_x, offset_y = region_offset
+        elif window_obj:
             offset_x = max(window_obj.left, 0)
             offset_y = max(window_obj.top, 0)
+        else:
+            offset_x, offset_y = 0, 0
 
         cv2_img = cv2.cvtColor(np_array, cv2.COLOR_RGB2BGR)
 
-        # Use region-splitting OCR for full-screen captures
-        if not window_obj:
+        # Use region-splitting OCR for full-screen captures (not for window/region)
+        if not window_obj and not region_offset:
             boxes, txts, scores = _ocr_with_regions(cv2_img)
         else:
             output = engine(cv2_img)
@@ -2115,18 +2335,20 @@ def click_text(
         Success message with matched text, score, and click coordinates, or error message.
     """
     try:
-        pil_img, np_array, key, window_obj, activation_warning = _take_screenshot_as_array(
-            title_pattern, use_regex, threshold, activate=True
+        pil_img, np_array, key, window_obj, activation_warning, region_offset = _take_screenshot_as_array(
+            title_pattern, use_regex, threshold, activate=True, region=region
         )
         if activation_warning:
             return activation_warning
 
-        # Determine window offset for absolute coordinates
-        offset_x = 0
-        offset_y = 0
-        if window_obj:
+        # Determine offset for absolute coordinates
+        if region_offset:
+            offset_x, offset_y = region_offset
+        elif window_obj:
             offset_x = max(window_obj.left, 0)
             offset_y = max(window_obj.top, 0)
+        else:
+            offset_x, offset_y = 0, 0
 
         # Convert RGB to BGR for OCR (RapidOCR expects BGR like cv2.imread)
         cv2_img = cv2.cvtColor(np_array, cv2.COLOR_RGB2BGR)
@@ -2272,6 +2494,663 @@ def fill_text_field(
     except Exception as e:
         log(f"Error in fill_text_field: {str(e)}")
         return f"Error in fill_text_field: {str(e)}"
+
+
+# ── UI Automation Tools ─────────────────────────────────────────────────
+
+
+@mcp.tool()
+def take_screenshot_with_ui_automation(
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 10,
+    region: list = None,
+) -> str:
+    """Get UI automation/accessibility tree elements with absolute screen coordinates.
+    Returns structured widget data (buttons, menus, entries, tabs, etc.) with roles, names,
+    actions, and bounding boxes. Only returns elements from visible/foreground windows
+    (occluded elements behind other windows are filtered out).
+    On Windows uses Microsoft UI Automation; on Linux uses AT-SPI.
+
+    Args:
+        title_pattern: Window to get elements from. None = all visible windows.
+        use_regex: If True, treat pattern as regex for window matching.
+        threshold: Fuzzy match threshold (0-100) for window title.
+
+    Returns:
+        JSON with UI automation elements. Each element has: role, name, bounds, actions, abs_center_x, abs_center_y (ready for click_screen).
+    """
+    try:
+        # If title_pattern provided, activate the target window first so it's in foreground
+        if title_pattern:
+            all_windows = gw.getAllWindows()
+            windows = [{"title": w.title, "window_obj": w} for w in all_windows if w.title]
+            matched = _find_matching_window(windows, title_pattern, use_regex, threshold)
+            if matched:
+                _force_activate_window(matched["window_obj"])
+                pyautogui.sleep(0.3)
+
+        result = get_ui_elements(app_filter=title_pattern, region=region)
+
+        if not result.get("available"):
+            return json.dumps(result)
+
+        # If title_pattern provided, filter to matching application/window
+        if title_pattern and matched and result.get("ui_elements", {}).get("applications"):
+            matched_title = matched["title"].lower()
+            filtered_apps = []
+            total_elements = 0
+            for app in result["ui_elements"]["applications"]:
+                app_name = app.get("application", "").lower()
+                # Match by app name or window title
+                if (matched_title in app_name or app_name in matched_title):
+                    filtered_apps.append(app)
+                    total_elements += len(app.get("elements", []))
+                    continue
+                # Also check window names in the stacking list
+                for win in result.get("windows", []):
+                    if win["id"] in app.get("window_ids", []):
+                        if matched_title in win.get("name", "").lower() or win.get("name", "").lower() in matched_title:
+                            filtered_apps.append(app)
+                            total_elements += len(app.get("elements", []))
+                            break
+
+            result["ui_elements"]["applications"] = filtered_apps
+            result["ui_elements"]["element_count"] = total_elements
+
+        return json.dumps(result, default=str)
+
+    except Exception as e:
+        log(f"Error in take_screenshot_with_ui_automation: {str(e)}")
+        return json.dumps({"error": str(e), "available": False})
+
+
+@mcp.tool()
+def take_screenshot_full(
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 10,
+    image_format: str = "png",
+    quality: int = 80,
+    color_mode: str = "color",
+    include_image: bool = True,
+    include_ocr: bool = True,
+    include_ui: bool = True,
+    region: list = None,
+) -> list:
+    """Get up to 3 perception layers in one call: prescaled screenshot image, OCR text elements, and UI automation elements.
+    Control which layers to include with include_image, include_ocr, include_ui flags.
+    OCR and UI automation coordinates are in original screen space (ready for click_screen directly).
+    Only the image is prescaled — use scale_factor to convert visual coordinate estimates from the image back to screen coords.
+
+    Args:
+        title_pattern: Window to capture. None = full screen.
+        use_regex: If True, treat pattern as regex for window matching.
+        threshold: Fuzzy match threshold (0-100) for window title.
+        image_format: Output format - "png" (default), "webp", or "jpeg".
+        quality: Compression quality 1-100 for webp/jpeg. Default: 80.
+        color_mode: "color" (default), "grayscale", or "bw".
+        include_image: Include prescaled screenshot image. Default True.
+        include_ocr: Include OCR text elements. Default True.
+        include_ui: Include UI automation/accessibility tree elements. Default True.
+
+    Returns:
+        List of [JSON summary with scale_factor + requested data, prescaled Image (if include_image)].
+    """
+    try:
+        # Take screenshot (always needed for OCR; also needed for image output)
+        pil_img, np_array, key, window_obj, activation_warning, region_offset = _take_screenshot_as_array(
+            title_pattern, use_regex, threshold, activate=True, region=region
+        )
+
+        # Prescale for agent
+        orig_w, orig_h = pil_img.size
+        prescaled_img, scale_factor = _prescale_for_agent(pil_img)
+        scaled_w, scaled_h = prescaled_img.size
+
+        image = None
+        if include_image:
+            try:
+                img_bytes, fmt = _process_image_for_output(
+                    prescaled_img, image_format=image_format,
+                    quality=quality, color_mode=color_mode,
+                )
+            except ValueError as e:
+                return [f"Invalid parameter: {str(e)}"]
+            image = Image(data=img_bytes, format=fmt)
+
+        # Run requested layers in parallel
+        ocr_result = {"elements": [], "element_count": 0, "time_s": 0}
+        ui_result = {"available": False, "error": "not requested"}
+
+        def run_ocr():
+            nonlocal ocr_result
+            t0 = time.perf_counter()
+            try:
+                cv2_img = cv2.cvtColor(np_array, cv2.COLOR_RGB2BGR)
+
+                # Calculate offset for absolute coordinates
+                if region_offset:
+                    offset_x, offset_y = region_offset
+                elif window_obj:
+                    offset_x = max(window_obj.left, 0)
+                    offset_y = max(window_obj.top, 0)
+                else:
+                    offset_x, offset_y = 0, 0
+
+                # Use region-splitting OCR for full-screen captures (not for window/region)
+                if not window_obj and not region_offset:
+                    boxes, txts, scores = _ocr_with_regions(cv2_img)
+                else:
+                    output = engine(cv2_img)
+                    boxes, txts, scores = output.boxes, output.txts, output.scores
+
+                elements = []
+                if boxes is not None and txts is not None:
+                    for box, text_val, score in zip(boxes, txts, scores):
+                        box_list = box.tolist() if hasattr(box, 'tolist') else box
+                        rel_center_x = int(sum(p[0] for p in box_list) / 4)
+                        rel_center_y = int(sum(p[1] for p in box_list) / 4)
+                        abs_center_x = rel_center_x + offset_x
+                        abs_center_y = rel_center_y + offset_y
+                        abs_box = [[int(p[0] + offset_x), int(p[1] + offset_y)] for p in box_list]
+
+                        elements.append({
+                            "text": text_val,
+                            "confidence": round(float(score), 4),
+                            "box": box_list,
+                            "abs_box": abs_box,
+                            "center_x": rel_center_x,
+                            "center_y": rel_center_y,
+                            "abs_center_x": abs_center_x,
+                            "abs_center_y": abs_center_y,
+                        })
+
+                ocr_result = {
+                    "elements": elements,
+                    "element_count": len(elements),
+                    "time_s": round(time.perf_counter() - t0, 3),
+                }
+            except Exception as e:
+                ocr_result = {
+                    "elements": [],
+                    "element_count": 0,
+                    "time_s": round(time.perf_counter() - t0, 3),
+                    "error": str(e),
+                }
+
+        def run_ui():
+            nonlocal ui_result
+            try:
+                ui_result = get_ui_elements(app_filter=title_pattern, region=region)
+            except Exception as e:
+                ui_result = {"available": False, "error": str(e)}
+
+        # Only submit tasks for requested layers
+        futures = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            if include_ocr:
+                futures.append(executor.submit(run_ocr))
+            if include_ui:
+                futures.append(executor.submit(run_ui))
+            for f in futures:
+                f.result()
+
+        # Build summary JSON
+        summary = {
+            "scale_factor": round(scale_factor, 4),
+            "screenshot_size": {"width": scaled_w, "height": scaled_h},
+            "original_size": {"width": orig_w, "height": orig_h},
+        }
+
+        if include_ocr:
+            summary["ocr"] = ocr_result
+
+        if include_ui:
+            summary["ui_automation"] = {
+                "available": ui_result.get("available", False),
+                "error": ui_result.get("error"),
+                "element_count": ui_result.get("ui_elements", {}).get("element_count", 0),
+                "filtered_out": ui_result.get("ui_elements", {}).get("filtered_out", 0),
+                "time_s": ui_result.get("ui_elements", {}).get("time_s", 0),
+                "applications": ui_result.get("ui_elements", {}).get("applications", []),
+                "windows": ui_result.get("windows", []),
+            }
+
+        if activation_warning:
+            summary["warning"] = activation_warning
+
+        result = [json.dumps(summary, default=str)]
+        if image is not None:
+            result.append(image)
+        return result
+
+    except Exception as e:
+        log(f"Error in take_screenshot_full: {str(e)}")
+        import traceback
+        return [json.dumps({"error": str(e), "traceback": traceback.format_exc()})]
+
+
+# ── Diff Helper Functions ───────────────────────────────────────────────
+
+
+def _compute_ocr_diff(old_results: List[Dict], new_results: List[Dict]) -> Dict:
+    """Compare two OCR result lists. Returns {changed, added, removed, changed_elements}.
+
+    Matches elements by fuzzy text content (ratio >= 80) + spatial proximity (centers within 50px).
+    """
+    added = []
+    removed = []
+    changed = []
+    matched_old = set()
+    matched_new = set()
+
+    # Try to match each new element to an old element
+    for ni, new_el in enumerate(new_results):
+        best_match = None
+        best_score = 0
+        new_cx = new_el.get("abs_center_x", new_el.get("center_x", 0))
+        new_cy = new_el.get("abs_center_y", new_el.get("center_y", 0))
+        new_text = new_el.get("text", "")
+
+        for oi, old_el in enumerate(old_results):
+            if oi in matched_old:
+                continue
+            old_cx = old_el.get("abs_center_x", old_el.get("center_x", 0))
+            old_cy = old_el.get("abs_center_y", old_el.get("center_y", 0))
+            old_text = old_el.get("text", "")
+
+            # Spatial proximity check
+            dist = ((new_cx - old_cx) ** 2 + (new_cy - old_cy) ** 2) ** 0.5
+            if dist > 50:
+                continue
+
+            # Text similarity check
+            text_score = fuzz.ratio(new_text, old_text)
+            if text_score >= 80 and text_score > best_score:
+                best_match = oi
+                best_score = text_score
+
+        if best_match is not None:
+            matched_old.add(best_match)
+            matched_new.add(ni)
+            # Check if text content actually changed
+            old_text = old_results[best_match].get("text", "")
+            new_text = new_el.get("text", "")
+            if old_text != new_text:
+                changed.append({"old": old_results[best_match], "new": new_el})
+
+    # Unmatched new elements are added
+    for ni, new_el in enumerate(new_results):
+        if ni not in matched_new:
+            added.append(new_el)
+
+    # Unmatched old elements are removed
+    for oi, old_el in enumerate(old_results):
+        if oi not in matched_old:
+            removed.append(old_el)
+
+    has_changes = bool(added or removed or changed)
+    return {
+        "changed": has_changes,
+        "added": added,
+        "removed": removed,
+        "changed_elements": changed,
+        "summary": f"{len(added)} added, {len(removed)} removed, {len(changed)} changed",
+    }
+
+
+def _compute_ui_diff(old_elements: Dict, new_elements: Dict) -> Dict:
+    """Compare two UI automation result dicts. Returns {changed, added, removed, changed_elements}.
+
+    Matches elements by composite key (role, name, approximate_bounds with 20px quantization).
+    """
+    def _get_app_elements(data: Dict) -> List[Dict]:
+        """Flatten all elements from all applications."""
+        elements = []
+        for app in data.get("ui_elements", {}).get("applications", []):
+            for el in app.get("elements", []):
+                elements.append(el)
+        return elements
+
+    def _element_key(el: Dict) -> str:
+        """Create a composite key for matching: role + name + quantized bounds."""
+        role = el.get("role", "")
+        name = el.get("name", "")
+        b = el.get("bounds", {})
+        # Quantize bounds to 20px grid for approximate matching
+        qx = (b.get("x", 0) // 20) * 20
+        qy = (b.get("y", 0) // 20) * 20
+        qw = (b.get("w", 0) // 20) * 20
+        qh = (b.get("h", 0) // 20) * 20
+        return f"{role}:{name}:{qx},{qy},{qw},{qh}"
+
+    old_flat = _get_app_elements(old_elements)
+    new_flat = _get_app_elements(new_elements)
+
+    # Build lookup maps
+    old_by_key = {}
+    for el in old_flat:
+        key = _element_key(el)
+        old_by_key.setdefault(key, []).append(el)
+
+    new_by_key = {}
+    for el in new_flat:
+        key = _element_key(el)
+        new_by_key.setdefault(key, []).append(el)
+
+    all_keys = set(old_by_key.keys()) | set(new_by_key.keys())
+
+    added = []
+    removed = []
+    changed = []
+
+    for key in all_keys:
+        old_els = old_by_key.get(key, [])
+        new_els = new_by_key.get(key, [])
+
+        if not old_els:
+            added.extend(new_els)
+        elif not new_els:
+            removed.extend(old_els)
+        else:
+            # Both exist — check for changes in text, actions, exact bounds
+            min_count = min(len(old_els), len(new_els))
+            for i in range(min_count):
+                o, n = old_els[i], new_els[i]
+                if (o.get("text") != n.get("text") or
+                    o.get("actions") != n.get("actions") or
+                    o.get("bounds") != n.get("bounds")):
+                    changed.append({"old": o, "new": n})
+            # Extra new elements
+            for i in range(min_count, len(new_els)):
+                added.append(new_els[i])
+            # Extra old elements
+            for i in range(min_count, len(old_els)):
+                removed.append(old_els[i])
+
+    has_changes = bool(added or removed or changed)
+    return {
+        "changed": has_changes,
+        "added": added,
+        "removed": removed,
+        "changed_elements": changed,
+        "summary": f"{len(added)} added, {len(removed)} removed, {len(changed)} changed",
+    }
+
+
+# ── Diff Tools ──────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def check_ocr_changed(
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 10,
+    region: list = None,
+) -> str:
+    """Compare current OCR text against last stored OCR result. Detects added, removed, and changed text on screen.
+    First call stores a baseline; subsequent calls detect changes against it.
+
+    Args:
+        title_pattern: Window to capture. None = full screen.
+        use_regex: Regex mode for window matching.
+        threshold: Fuzzy match threshold for window title.
+
+    Returns:
+        JSON: {"changed": bool, "first_check": bool, "ocr_diff": {"added": [...], "removed": [...], "changed_elements": [...]}}
+    """
+    try:
+        pil_img, np_array, key, window_obj, _, region_offset = _take_screenshot_as_array(
+            title_pattern, use_regex, threshold, activate=True, region=region
+        )
+
+        # Run OCR
+        cv2_img = cv2.cvtColor(np_array, cv2.COLOR_RGB2BGR)
+        if region_offset:
+            offset_x, offset_y = region_offset
+        elif window_obj:
+            offset_x = max(window_obj.left, 0)
+            offset_y = max(window_obj.top, 0)
+        else:
+            offset_x, offset_y = 0, 0
+
+        if not window_obj and not region_offset:
+            boxes, txts, scores = _ocr_with_regions(cv2_img)
+        else:
+            output = engine(cv2_img)
+            boxes, txts, scores = output.boxes, output.txts, output.scores
+
+        current_results = []
+        if boxes is not None and txts is not None:
+            for box, text_val, score in zip(boxes, txts, scores):
+                box_list = box.tolist() if hasattr(box, 'tolist') else box
+                rel_cx = int(sum(p[0] for p in box_list) / 4)
+                rel_cy = int(sum(p[1] for p in box_list) / 4)
+                current_results.append({
+                    "text": text_val,
+                    "confidence": round(float(score), 4),
+                    "abs_center_x": rel_cx + offset_x,
+                    "abs_center_y": rel_cy + offset_y,
+                })
+
+        if key not in _last_ocr_results:
+            _last_ocr_results[key] = current_results
+            return json.dumps({
+                "changed": False,
+                "first_check": True,
+                "ocr_diff": {"added": [], "removed": [], "changed_elements": [], "summary": "Baseline stored"},
+                "message": "OCR baseline stored. Call again to detect changes.",
+            })
+
+        diff = _compute_ocr_diff(_last_ocr_results[key], current_results)
+        _last_ocr_results[key] = current_results
+
+        return json.dumps({
+            "changed": diff["changed"],
+            "first_check": False,
+            "ocr_diff": diff,
+        }, default=str)
+
+    except Exception as e:
+        log(f"Error in check_ocr_changed: {str(e)}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def check_ui_automation_changed(
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 10,
+    region: list = None,
+) -> str:
+    """Compare current UI automation elements against last stored result. Detects added, removed, and changed widgets.
+    First call stores a baseline; subsequent calls detect changes against it.
+
+    Args:
+        title_pattern: Window to check. None = all visible windows.
+        use_regex: Regex mode for window matching.
+        threshold: Fuzzy match threshold for window title.
+
+    Returns:
+        JSON: {"changed": bool, "first_check": bool, "ui_diff": {"added": [...], "removed": [...], "changed_elements": [...]}}
+    """
+    try:
+        key = "full_screen"
+        if title_pattern:
+            key = title_pattern
+
+        current = get_ui_elements(app_filter=title_pattern, region=region)
+
+        if not current.get("available"):
+            return json.dumps(current)
+
+        if key not in _last_ui_elements:
+            _last_ui_elements[key] = current
+            return json.dumps({
+                "changed": False,
+                "first_check": True,
+                "ui_diff": {"added": [], "removed": [], "changed_elements": [], "summary": "Baseline stored"},
+                "message": "UI automation baseline stored. Call again to detect changes.",
+            })
+
+        diff = _compute_ui_diff(_last_ui_elements[key], current)
+        _last_ui_elements[key] = current
+
+        return json.dumps({
+            "changed": diff["changed"],
+            "first_check": False,
+            "ui_diff": diff,
+        }, default=str)
+
+    except Exception as e:
+        log(f"Error in check_ui_automation_changed: {str(e)}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def check_screen_changed_full(
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 10,
+    pixel_threshold: int = 30,
+    min_region_area: int = 100,
+    include_image_diff: bool = True,
+    include_ocr_diff: bool = True,
+    include_ui_diff: bool = True,
+    region: list = None,
+) -> str:
+    """Unified diff across up to 3 layers in one call: image pixel diff, OCR text diff, and UI automation element diff.
+    First call stores baselines for enabled layers; subsequent calls return what changed.
+    Control which layers to diff with include_image_diff, include_ocr_diff, include_ui_diff flags.
+
+    Args:
+        title_pattern: Window to capture. None = full screen.
+        use_regex: Regex mode for window matching.
+        threshold: Fuzzy match threshold for window title.
+        pixel_threshold: Per-pixel difference threshold (0-255). Default 30.
+        min_region_area: Minimum area for a changed image region. Default 100.
+        include_image_diff: Include pixel-level image diff. Default True.
+        include_ocr_diff: Include OCR text diff. Default True.
+        include_ui_diff: Include UI automation element diff. Default True.
+
+    Returns:
+        JSON: {"changed": bool, "first_check": bool, ...} with requested diff sections.
+    """
+    try:
+        pil_img, new_array, key, window_obj, _, region_offset = _take_screenshot_as_array(
+            title_pattern, use_regex, threshold, activate=True, region=region
+        )
+
+        is_first = key not in _last_screenshots
+
+        # Image diff
+        image_diff = None
+        if include_image_diff:
+            if is_first:
+                image_diff = {"change_percent": 0.0, "regions": []}
+            else:
+                changed, change_pct, regions = _compute_diff_regions(
+                    _last_screenshots[key], new_array, pixel_threshold, min_region_area
+                )
+                image_diff = {"change_percent": change_pct, "regions": regions}
+            _last_screenshots[key] = new_array
+
+        # Run OCR and UI automation in parallel (only requested layers)
+        ocr_results = []
+        ui_data = {}
+
+        def run_ocr():
+            nonlocal ocr_results
+            try:
+                cv2_img = cv2.cvtColor(new_array, cv2.COLOR_RGB2BGR)
+                if region_offset:
+                    offset_x, offset_y = region_offset
+                elif window_obj:
+                    offset_x = max(window_obj.left, 0)
+                    offset_y = max(window_obj.top, 0)
+                else:
+                    offset_x, offset_y = 0, 0
+
+                if not window_obj and not region_offset:
+                    boxes, txts, scores = _ocr_with_regions(cv2_img)
+                else:
+                    output = engine(cv2_img)
+                    boxes, txts, scores = output.boxes, output.txts, output.scores
+
+                if boxes is not None and txts is not None:
+                    for box, text_val, score in zip(boxes, txts, scores):
+                        box_list = box.tolist() if hasattr(box, 'tolist') else box
+                        rel_cx = int(sum(p[0] for p in box_list) / 4)
+                        rel_cy = int(sum(p[1] for p in box_list) / 4)
+                        ocr_results.append({
+                            "text": text_val,
+                            "confidence": round(float(score), 4),
+                            "abs_center_x": rel_cx + offset_x,
+                            "abs_center_y": rel_cy + offset_y,
+                        })
+            except Exception as e:
+                log(f"Error in OCR for check_screen_changed_full: {str(e)}")
+
+        def run_ui():
+            nonlocal ui_data
+            try:
+                ui_data = get_ui_elements(app_filter=title_pattern, region=region)
+            except Exception as e:
+                ui_data = {"available": False, "error": str(e)}
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            if include_ocr_diff:
+                futures.append(executor.submit(run_ocr))
+            if include_ui_diff:
+                futures.append(executor.submit(run_ui))
+            for f in futures:
+                f.result()
+
+        # OCR diff
+        ocr_diff = None
+        if include_ocr_diff:
+            if is_first:
+                ocr_diff = {"changed": False, "added": [], "removed": [], "changed_elements": [], "summary": "Baseline stored"}
+            else:
+                ocr_diff = _compute_ocr_diff(_last_ocr_results.get(key, []), ocr_results)
+            _last_ocr_results[key] = ocr_results
+
+        # UI diff
+        ui_diff = None
+        if include_ui_diff:
+            if ui_data.get("available"):
+                if is_first:
+                    ui_diff = {"changed": False, "added": [], "removed": [], "changed_elements": [], "summary": "Baseline stored"}
+                else:
+                    ui_diff = _compute_ui_diff(_last_ui_elements.get(key, {}), ui_data)
+                _last_ui_elements[key] = ui_data
+            else:
+                ui_diff = {"changed": False, "added": [], "removed": [], "changed_elements": [], "summary": ui_data.get("error", "UI automation not available")}
+
+        any_changed = (
+            (image_diff is not None and image_diff.get("change_percent", 0) > 0) or
+            (ocr_diff is not None and ocr_diff.get("changed", False)) or
+            (ui_diff is not None and ui_diff.get("changed", False))
+        )
+
+        result = {
+            "changed": any_changed,
+            "first_check": is_first,
+        }
+        if image_diff is not None:
+            result["image_diff"] = image_diff
+        if ocr_diff is not None:
+            result["ocr_diff"] = ocr_diff
+        if ui_diff is not None:
+            result["ui_diff"] = ui_diff
+
+        return json.dumps(result, default=str)
+
+    except Exception as e:
+        log(f"Error in check_screen_changed_full: {str(e)}")
+        return json.dumps({"error": str(e)})
 
 
 def main():
