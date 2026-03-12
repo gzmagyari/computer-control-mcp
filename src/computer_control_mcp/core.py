@@ -1091,6 +1091,46 @@ def _safe_format_ocr_results(results: List[Tuple]) -> str:
         return f"<OCR results with {len(results)} items>"
 
 
+def _filter_ocr_elements(elements: list, text_filter: str, match_threshold: int = 60) -> list:
+    """Filter and score OCR elements against pipe-separated search terms.
+
+    Args:
+        elements: List of OCR element dicts (must have "text" key).
+        text_filter: Pipe-separated search terms, e.g. "mem4|mem 4".
+        match_threshold: Minimum fuzzy match score (0-100). Default 60.
+
+    Returns:
+        Filtered list sorted by best match score descending, with "match_score" added to each element.
+    """
+    search_terms = [t.strip() for t in text_filter.split("|") if t.strip()]
+    if not search_terms:
+        return elements
+
+    filtered = []
+    for elem in elements:
+        ocr_text = elem.get("text", "")
+        if len(ocr_text) < 1:
+            continue
+
+        # Score against each search term, keep the best
+        best_score = 0
+        for term in search_terms:
+            fuzzy_score = fuzz.partial_ratio(term, ocr_text)
+            # Length penalty: prefer results closer in length to the search term
+            length_ratio = min(len(term), len(ocr_text)) / max(len(term), len(ocr_text))
+            combined = round(fuzzy_score * 0.7 + (length_ratio * 100) * 0.3)
+            best_score = max(best_score, combined)
+
+        if best_score >= match_threshold:
+            elem_copy = dict(elem)
+            elem_copy["match_score"] = best_score
+            filtered.append(elem_copy)
+
+    # Sort by match score descending, then top-to-bottom, left-to-right
+    filtered.sort(key=lambda e: (-e["match_score"], e.get("abs_center_y", 0), e.get("abs_center_x", 0)))
+    return filtered
+
+
 # --- Region-splitting OCR helpers ---
 
 _thread_local = threading.local()
@@ -1294,9 +1334,11 @@ def take_screenshot_with_ocr(
     quality: int = 80,
     color_mode: str = "color",
     region: list = None,
+    ocr_text_filter: str = None,
+    ocr_match_threshold: int = 60,
 ) -> str:
     """
-    Get OCR text from screenshot with absolute coordinates as JSON string of List[Tuple[List[List[int]], str, float]] (returned after adding the window offset from true (0, 0) of screen to the OCR coordinates, so clicking is on-point. Recommended to click in the middle of OCR Box) and using confidence from window with the specified title pattern. If no title pattern is provided, get screenshot of entire screen and all text on the screen. Know that OCR takes around 20 seconds on an mid-spec pc at 1080p resolution.
+    Get OCR text from screenshot with absolute coordinates. If no title pattern is provided, captures the entire screen.
 
     Args:
         title_pattern: Pattern to match window title, if None, take screenshot of entire screen
@@ -1307,9 +1349,14 @@ def take_screenshot_with_ocr(
         image_format: Output format for saved file - "png" (default), "webp" (much smaller), or "jpeg". Only applies when save_to_downloads is True
         quality: Compression quality 1-100 for webp/jpeg when saving. Default: 80
         color_mode: Color mode for saved file - "color" (default), "grayscale", or "bw". Only applies when save_to_downloads is True
+        ocr_text_filter: Search filter for OCR results — only return text matching this filter. Supports pipe-separated
+            terms for OR matching, e.g. "mem4|mem 4|mem_4". Uses fuzzy matching so exact spelling isn't required.
+            When set, results are sorted by match score (best first). When None, returns all OCR text.
+        ocr_match_threshold: Minimum fuzzy match score (0-100) for ocr_text_filter. Default 60. Lower = more results.
 
     Returns:
         JSON array of detected text elements. Each element has: text, confidence, box (relative corners), abs_box (absolute screen corners), center_x/center_y (relative), abs_center_x/abs_center_y (absolute screen coordinates ready for click_screen).
+        When ocr_text_filter is used, each element also has match_score and results are sorted by best match first.
     """
     try:
         all_windows = gw.getAllWindows()
@@ -1463,6 +1510,12 @@ def take_screenshot_with_ocr(
 
         log(f"Found {len(results)} text items in OCR result.")
         log(f"First 5 items: {_safe_format_ocr_results([(r['box'], r['text'], r['confidence']) for r in results[:5]])}")
+
+        # Apply text filter if provided
+        if ocr_text_filter and results:
+            results = _filter_ocr_elements(results, ocr_text_filter, ocr_match_threshold)
+            log(f"After filter '{ocr_text_filter}': {len(results)} matches")
+
         return json.dumps(results) if results else "No text found"
 
     except Exception as e:
@@ -2404,7 +2457,8 @@ def find_text(
     Pair with click_screen(x, y) to click a specific match.
 
     Args:
-        text: The text string to search for.
+        text: The text to search for. Supports pipe-separated terms for OR matching,
+              e.g. "mem4|mem 4|mem_4" will match any of those. Uses fuzzy matching.
         title_pattern: Optional window to search in.
         use_regex: Regex mode for window matching.
         threshold: Fuzzy match threshold for window title.
@@ -2439,17 +2493,23 @@ def find_text(
         if not txts or len(txts) == 0:
             return json.dumps({"matches": [], "total": 0, "error": "No text found on screen via OCR"})
 
-        search_len = len(text)
+        # Support pipe-separated search terms
+        search_terms = [t.strip() for t in text.split("|") if t.strip()]
         matches = []
         for i, ocr_text in enumerate(txts):
-            if len(ocr_text) < 3:
+            if len(ocr_text) < 1:
                 continue
 
-            fuzzy_score = fuzz.partial_ratio(text, ocr_text)
-            if fuzzy_score >= match_threshold:
-                ocr_len = len(ocr_text)
-                length_ratio = min(search_len, ocr_len) / max(search_len, ocr_len)
-                combined_score = round(fuzzy_score * 0.7 + (length_ratio * 100) * 0.3)
+            # Score against each search term, keep the best
+            best_score = 0
+            for term in search_terms:
+                fuzzy_score = fuzz.partial_ratio(term, ocr_text)
+                length_ratio = min(len(term), len(ocr_text)) / max(len(term), len(ocr_text))
+                combined = round(fuzzy_score * 0.7 + (length_ratio * 100) * 0.3)
+                best_score = max(best_score, combined)
+
+            combined_score = best_score
+            if combined_score >= match_threshold:
 
                 box = boxes[i]
                 # Relative coordinates (within the captured region)
@@ -2780,6 +2840,8 @@ def take_screenshot_full(
     ui_name_filter: str = None,
     ui_role_filter: str = None,
     ui_interactable_only: bool = False,
+    ocr_text_filter: str = None,
+    ocr_match_threshold: int = 60,
 ) -> list:
     """Get up to 3 perception layers in one call: prescaled screenshot image, OCR text elements, and UI automation elements.
     Control which layers to include with include_image, include_ocr, include_ui flags.
@@ -2801,6 +2863,10 @@ def take_screenshot_full(
         ui_role_filter: Filter UI elements by role (pipe-separated).
                         E.g. "push button|entry|link|list item". Only applies to UI automation layer.
         ui_interactable_only: If True, only return UI elements with actions (clickable, etc.).
+        ocr_text_filter: Search filter for OCR results — only return text matching this filter. Supports pipe-separated
+            terms for OR matching, e.g. "mem4|mem 4|mem_4". Uses fuzzy matching so exact spelling isn't required.
+            When set, results are sorted by match score (best first). When None, returns all OCR text.
+        ocr_match_threshold: Minimum fuzzy match score (0-100) for ocr_text_filter. Default 60.
 
     Returns:
         List of [JSON summary with scale_factor + requested data, prescaled Image (if include_image)].
@@ -2874,11 +2940,23 @@ def take_screenshot_full(
                             "abs_center_y": abs_center_y,
                         })
 
-                ocr_result = {
-                    "elements": elements,
-                    "element_count": len(elements),
-                    "time_s": round(time.perf_counter() - t0, 3),
-                }
+                # Apply text filter if provided
+                if ocr_text_filter and elements:
+                    total_before = len(elements)
+                    elements = _filter_ocr_elements(elements, ocr_text_filter, ocr_match_threshold)
+                    ocr_result = {
+                        "elements": elements,
+                        "element_count": len(elements),
+                        "total_before_filter": total_before,
+                        "filter": ocr_text_filter,
+                        "time_s": round(time.perf_counter() - t0, 3),
+                    }
+                else:
+                    ocr_result = {
+                        "elements": elements,
+                        "element_count": len(elements),
+                        "time_s": round(time.perf_counter() - t0, 3),
+                    }
             except Exception as e:
                 ocr_result = {
                     "elements": [],
