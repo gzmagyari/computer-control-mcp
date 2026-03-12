@@ -106,28 +106,16 @@ def log(message: str) -> None:
     when printing special characters on Windows terminals.
     """
     try:
-        if IS_DEVELOPMENT:
-            # In dev, write to stderr
-            print(f"[DEV] {message}", file=sys.stderr)
-        else:
-            # In production, write to stdout or a file
-            print(f"[PROD] {message}", file=sys.stdout)
-            # or append to a file: open("app.log", "a").write(message+"\n")
+        # Always log to stderr — stdout is reserved for MCP JSON-RPC transport
+        print(f"[LOG] {message}", file=sys.stderr)
     except UnicodeEncodeError:
-        # Handle encoding errors by escaping or replacing problematic characters
         safe_message = message.encode('ascii', errors='replace').decode('ascii')
-        if IS_DEVELOPMENT:
-            print(f"[DEV] {safe_message}", file=sys.stderr)
-        else:
-            print(f"[PROD] {safe_message}", file=sys.stdout)
+        print(f"[LOG] {safe_message}", file=sys.stderr)
     except Exception:
         # Fallback for any other printing errors
         try:
             safe_message = repr(message)  # Use repr to escape special characters
-            if IS_DEVELOPMENT:
-                print(f"[DEV] {safe_message}", file=sys.stderr)
-            else:
-                print(f"[PROD] {safe_message}", file=sys.stdout)
+            print(f"[LOG] {safe_message}", file=sys.stderr)
         except Exception:
             # Last resort - if even repr fails, don't crash
             pass
@@ -505,9 +493,25 @@ def _force_activate_window(window):
 
         # Bring to top and set foreground
         if sys.platform == "win32":
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-            ctypes.windll.user32.BringWindowToTop(hwnd)
-        window.activate()  # fallback / non-Windows
+            user32 = ctypes.windll.user32
+            # AttachThreadInput trick: attach our thread to the foreground
+            # window's thread so Windows allows SetForegroundWindow to succeed
+            # (otherwise it just flashes the taskbar icon)
+            fore_hwnd = user32.GetForegroundWindow()
+            fore_tid = user32.GetWindowThreadProcessId(fore_hwnd, None)
+            our_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            attached = False
+            if fore_tid != our_tid:
+                attached = user32.AttachThreadInput(our_tid, fore_tid, True)
+            try:
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE — unminimize if needed
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(our_tid, fore_tid, False)
+        else:
+            window.activate()  # fallback / non-Windows
         time.sleep(0.3)  # wait for OS to update
 
         # Verify input still works after activation (Windows UIPI can block input
@@ -2568,6 +2572,9 @@ def take_screenshot_with_ui_automation(
     use_regex: bool = False,
     threshold: int = 10,
     region: list = None,
+    name_filter: str = None,
+    role_filter: str = None,
+    interactable_only: bool = False,
 ) -> str:
     """Get UI automation/accessibility tree elements with absolute screen coordinates.
     Returns structured widget data (buttons, menus, entries, tabs, etc.) with roles, names,
@@ -2579,6 +2586,13 @@ def take_screenshot_with_ui_automation(
         title_pattern: Window to get elements from. None = all visible windows.
         use_regex: If True, treat pattern as regex for window matching.
         threshold: Fuzzy match threshold (0-100) for window title.
+        name_filter: Only return elements whose name contains this string (case-insensitive).
+                     Supports "|" for OR, e.g. "Search|GitHub|Close" matches any.
+        role_filter: Only return elements matching these roles (pipe-separated).
+                     E.g. "push button|entry|link|list item". Common roles: push button, entry,
+                     link, text, list item, page tab, menu item, check box, image, tool bar.
+        interactable_only: If True, only return elements that have actions (clickable, toggleable, etc.).
+                           Dramatically reduces output size by filtering out passive containers.
 
     Returns:
         JSON with UI automation elements. Each element has: role, name, bounds, actions, abs_center_x, abs_center_y (ready for click_screen).
@@ -2593,7 +2607,11 @@ def take_screenshot_with_ui_automation(
                 _force_activate_window(matched["window_obj"])
                 pyautogui.sleep(0.3)
 
-        result = get_ui_elements(app_filter=title_pattern, region=region)
+        result = get_ui_elements(
+            app_filter=title_pattern, region=region,
+            name_filter=name_filter, role_filter=role_filter,
+            interactable_only=interactable_only,
+        )
 
         if not result.get("available"):
             return json.dumps(result)
@@ -2643,6 +2661,9 @@ def take_screenshot_full(
     include_ocr: bool = True,
     include_ui: bool = True,
     region: list = None,
+    ui_name_filter: str = None,
+    ui_role_filter: str = None,
+    ui_interactable_only: bool = False,
 ) -> list:
     """Get up to 3 perception layers in one call: prescaled screenshot image, OCR text elements, and UI automation elements.
     Control which layers to include with include_image, include_ocr, include_ui flags.
@@ -2659,6 +2680,11 @@ def take_screenshot_full(
         include_image: Include prescaled screenshot image. Default True.
         include_ocr: Include OCR text elements. Default True.
         include_ui: Include UI automation/accessibility tree elements. Default True.
+        ui_name_filter: Filter UI elements by name (case-insensitive). Supports "|" for OR,
+                        e.g. "Search|GitHub|Close" matches any. Only applies to UI automation layer.
+        ui_role_filter: Filter UI elements by role (pipe-separated).
+                        E.g. "push button|entry|link|list item". Only applies to UI automation layer.
+        ui_interactable_only: If True, only return UI elements with actions (clickable, etc.).
 
     Returns:
         List of [JSON summary with scale_factor + requested data, prescaled Image (if include_image)].
@@ -2748,7 +2774,11 @@ def take_screenshot_full(
         def run_ui():
             nonlocal ui_result
             try:
-                ui_result = get_ui_elements(app_filter=title_pattern, region=region)
+                ui_result = get_ui_elements(
+                    app_filter=title_pattern, region=region,
+                    name_filter=ui_name_filter, role_filter=ui_role_filter,
+                    interactable_only=ui_interactable_only,
+                )
             except Exception as e:
                 ui_result = {"available": False, "error": str(e)}
 

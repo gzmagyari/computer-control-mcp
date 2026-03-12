@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "computer-control-mcp-enhanced"
-version = "0.4.4"
+version = "0.4.5"
 description = "Enhanced MCP server for computer control: mouse, keyboard, screenshots, OCR, UI automation, region capture, accessibility-aware app launching. Fork of computer-control-mcp with major perception and automation improvements."
 readme = "README.md"
 requires-python = ">=3.8"

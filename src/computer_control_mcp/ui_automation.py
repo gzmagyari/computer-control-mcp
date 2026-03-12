@@ -829,7 +829,53 @@ def _get_ui_elements_linux(app_filter: Optional[str] = None) -> Dict:
 # ── Public API ──────────────────────────────────────────────────────────
 
 
-def get_ui_elements(app_filter: Optional[str] = None, region: Optional[list] = None) -> Dict:
+def _filter_elements(
+    elements: List[Dict],
+    name_filter: Optional[str] = None,
+    role_filter: Optional[str] = None,
+    interactable_only: bool = False,
+) -> List[Dict]:
+    """Filter UI elements by name, role, and/or interactability.
+
+    Supports pipe-separated OR conditions for both name and role filters.
+
+    Args:
+        elements: List of UI element dicts.
+        name_filter: Case-insensitive substring match on element name.
+                     Supports "|" for OR, e.g. "Search|GitHub|Close" matches any.
+        role_filter: Pipe-separated roles to keep, e.g. "push button|entry|link".
+        interactable_only: If True, only keep elements that have actions.
+
+    Returns:
+        Filtered list of elements.
+    """
+    if not name_filter and not role_filter and not interactable_only:
+        return elements
+
+    name_patterns = [n.strip().lower() for n in name_filter.split("|")] if name_filter else None
+    role_set = set(r.strip().lower() for r in role_filter.split("|")) if role_filter else None
+
+    filtered = []
+    for el in elements:
+        if interactable_only and not el.get("actions"):
+            continue
+        if role_set and el.get("role", "").lower() not in role_set:
+            continue
+        if name_patterns:
+            el_name = (el.get("name") or "").lower()
+            if not any(p in el_name for p in name_patterns):
+                continue
+        filtered.append(el)
+    return filtered
+
+
+def get_ui_elements(
+    app_filter: Optional[str] = None,
+    region: Optional[list] = None,
+    name_filter: Optional[str] = None,
+    role_filter: Optional[str] = None,
+    interactable_only: bool = False,
+) -> Dict:
     """
     Get UI automation (accessibility tree) elements for the current screen.
 
@@ -842,6 +888,13 @@ def get_ui_elements(app_filter: Optional[str] = None, region: Optional[list] = N
                     collection by skipping irrelevant app trees.
         region: If provided, [x, y, width, height] in absolute screen coordinates.
                 Only returns elements whose center falls within this region.
+        name_filter: If provided, only return elements whose name contains this
+                     string (case-insensitive). Supports "|" for OR conditions,
+                     e.g. "Search|GitHub|Close" matches any of those.
+        role_filter: If provided, only return elements matching these roles.
+                     Pipe-separated, e.g. "push button|entry|link|list item".
+        interactable_only: If True, only return elements that have actions
+                           (clickable, toggleable, etc.). Dramatically reduces output size.
 
     Returns a dict with:
         - available: bool — whether the platform's accessibility API is available
@@ -888,5 +941,23 @@ def get_ui_elements(app_filter: Optional[str] = None, region: Optional[list] = N
         result["ui_elements"]["applications"] = filtered_apps
         result["ui_elements"]["filtered_out"] = result["ui_elements"].get("filtered_out", 0) + removed
         result["ui_elements"]["element_count"] = sum(len(a["elements"]) for a in filtered_apps)
+
+    # Apply element-level filtering (name, role, interactable)
+    if (name_filter or role_filter or interactable_only) and result.get("ui_elements", {}).get("applications"):
+        new_apps = []
+        total_removed = 0
+        for app in result["ui_elements"]["applications"]:
+            original_count = len(app["elements"])
+            kept = _filter_elements(app["elements"], name_filter, role_filter, interactable_only)
+            total_removed += original_count - len(kept)
+            if kept:
+                new_apps.append({
+                    "application": app["application"],
+                    "window_ids": app.get("window_ids", []),
+                    "elements": kept,
+                })
+        result["ui_elements"]["applications"] = new_apps
+        result["ui_elements"]["filtered_out"] = result["ui_elements"].get("filtered_out", 0) + total_removed
+        result["ui_elements"]["element_count"] = sum(len(a["elements"]) for a in new_apps)
 
     return result
