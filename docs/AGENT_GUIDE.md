@@ -25,6 +25,73 @@ No single source captures everything on screen. Use the right combination:
 
 ---
 
+## CRITICAL: Verify Every Action (Never Blind-Chain)
+
+**Keyboard and mouse tools always report "success" even when the intended target didn't receive the input.** This is the #1 cause of agent failures. `pyautogui` sends keystrokes to whatever window is focused — it has no way to know if the right window got them.
+
+### The problem: blind action chaining
+
+```
+# DANGEROUS — this can silently fail at any step
+press_keys("win+r")           # → "success" (but Run dialog may not have opened)
+type_text("notepad")          # → "success" (but typed into the wrong window)
+press_keys("enter")           # → "success" (but hit enter in VS Code terminal)
+press_keys([["ctrl", "o"]])   # → "success" (but Ctrl+O in the wrong app)
+```
+
+Every tool reports success because it successfully *sent* the input — but nothing verified the *effect*. The agent proceeds confidently through 4 actions, all targeting the wrong window.
+
+### The fix: verify after every state-changing action
+
+```
+# SAFE — verify each step before proceeding
+press_keys("win+r")
+take_screenshot_full(image_format="webp", quality=30, include_ocr=false, include_ui=false)
+# → Verify: is the Run dialog visible? If not, retry or try a different approach
+
+type_text("notepad")
+press_keys("enter")
+wait_for_element(name_filter="Notepad", title_pattern="Notepad", timeout_ms=5000)
+# → Verify: did Notepad open? If timed out, it didn't work
+
+take_screenshot_full(image_format="webp", quality=30, include_ocr=false, include_ui=false)
+# → Visual confirmation: Notepad is in foreground
+
+press_keys([["ctrl", "o"]])
+take_screenshot_full(image_format="webp", quality=30, include_ocr=false, include_ui=false)
+# → Verify: is the Open dialog showing?
+```
+
+### Rules for safe autonomous operation
+
+1. **Screenshot after every major action** — opening apps, switching windows, clicking buttons, submitting forms. Use Tier 1 screenshots (webp, quality=30, image only) — they're cheap (~67 KB).
+
+2. **Use `wait_for_text` / `wait_for_element` after launching apps** — don't assume the app opened. Wait for it with a timeout.
+
+3. **Activate the target window before keyboard input** — always call `activate_window(title_pattern="...")` before `type_text` or `press_keys` to ensure the right window is focused.
+
+4. **Never chain more than 1-2 blind actions** — if you type + press Enter, take a screenshot to see what happened before doing more.
+
+5. **If something looks wrong, stop and re-assess** — don't keep sending inputs hoping it'll work. Take a screenshot, understand the current state, then decide.
+
+### Actions that ALWAYS need verification
+
+| Action | Verify with |
+|--------|------------|
+| Launch an app | `wait_for_element` or screenshot |
+| Open a dialog (Ctrl+O, Ctrl+S, etc.) | Screenshot — is the dialog visible? |
+| Switch windows | Screenshot — is the right window in foreground? |
+| Submit a form / press Enter | Screenshot — did the expected result happen? |
+| Close a dialog / window | Screenshot — is it gone? |
+| Navigate to a URL | Screenshot or `wait_for_text` — did the page load? |
+| Click a button | Screenshot — did the UI change as expected? |
+
+### Cost of verification vs cost of failure
+
+A Tier 1 confirmation screenshot costs **~67 KB**. A failed blind action chain can waste **5-10 tool calls** going down the wrong path, plus the recovery effort. Always verify — it's cheaper than debugging.
+
+---
+
 ## Tool Selection Quick Reference
 
 | I want to... | Use this tool | Key parameters |
@@ -41,7 +108,8 @@ No single source captures everything on screen. Use the right combination:
 | Type into a field | `click_screen` → `type_text` | Click the field first, then type |
 | Scroll a page | `scroll` | `title_pattern` to activate first |
 | Bring a window to front | `activate_window` | `title_pattern` |
-| Open an application | `launch_app` | Launches with accessibility flags |
+| Open an app (known command) | `launch_app` | `command=["google-chrome"]` — enables accessibility |
+| Open an app (desktop icon) | OCR + double-click | `ocr_text_filter="VLC"` → `click_screen(num_clicks=2)` |
 | Verify before clicking | `capture_region_around` | Small region around target coords |
 | Check if something changed | `check_screen_changed_full` | After performing an action |
 
@@ -369,6 +437,62 @@ find_text(text="Submit|OK|Save")
 3. take_screenshot_full(...)  → verify dialog dismissed
 ```
 
+### Launch an Application
+
+**Always prefer `launch_app` when you know the app's command-line name.** It launches the app with accessibility flags enabled, which makes UI automation dramatically more effective.
+
+```
+# Open Chrome with full accessibility (exposes all web page elements via UIA)
+launch_app(command=["google-chrome", "https://example.com"])
+
+# Open VS Code in a specific directory
+launch_app(command=["code", "/path/to/project"])
+
+# Open Notepad
+launch_app(command=["notepad"])
+
+# Preview what would happen without launching
+launch_app(command=["google-chrome"], dry_run=true)
+```
+
+**Why this matters:**
+- Chromium/Electron apps launched normally expose **very few** web page elements to UI automation
+- `launch_app` adds `--force-renderer-accessibility`, which makes the browser expose **all** page elements (links, headings, paragraphs, form fields, etc.)
+- Without this flag, you're limited to OCR + vision for web content; with it, you get precise coordinates from UI automation
+- Also handles VS Code (`ACCESSIBILITY_ENABLED=1`), Qt apps (`QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`), and GTK/GNOME apps (AT-SPI activation)
+
+**Common app commands:**
+
+| App | Command |
+|-----|---------|
+| Google Chrome | `["google-chrome"]` or `["chrome"]` (Windows) |
+| Microsoft Edge | `["msedge"]` or `["microsoft-edge"]` |
+| Firefox | `["firefox"]` |
+| VS Code | `["code"]` or `["code", "."]` |
+| Notepad | `["notepad"]` |
+| Notepad++ | `["notepad++"]` |
+| File Explorer | `["explorer"]` |
+| Terminal | `["cmd"]` or `["powershell"]` (Windows), `["gnome-terminal"]` (Linux) |
+
+**When to use `launch_app` vs double-clicking a desktop icon:**
+
+| Scenario | Use |
+|----------|-----|
+| You know the command name | `launch_app` — faster, more reliable, enables accessibility |
+| App has no CLI command / only has a desktop shortcut | OCR + double-click the desktop icon |
+| Need to pass arguments (URL, file path, flags) | `launch_app` — supports full command-line args |
+| App is already running, need another instance | `launch_app` — opens a new instance |
+
+**Verification after launch:**
+```
+launch_app(command=["notepad"])
+wait_for_element(name_filter="Notepad", role_filter="window", timeout_ms=5000)
+# OR
+take_screenshot_full(image_format="webp", quality=30, include_ocr=false, include_ui=false)
+```
+
+---
+
 ### Coordinate Refinement Loop (vision-based interaction)
 
 **When to use:** When UI automation doesn't expose the element you need to interact with.
@@ -511,9 +635,9 @@ the universal fallback for any coordinate-based interaction.
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | Window doesn't activate | Old activation method (just flashes taskbar) | Use latest version with `AttachThreadInput` fix |
-| UI automation returns 0 elements | Window not in foreground, or app has no accessibility support | Activate window first; for Chromium apps, launch with `--force-renderer-accessibility` |
+| UI automation returns 0 elements | Window not in foreground, or app has no accessibility support | Activate window first; use `launch_app` to relaunch with accessibility flags enabled |
 | Scroll doesn't work | Mouse not over target window/element | Use `title_pattern` on `scroll` tool, or `click_screen` on the page first |
-| Can't find web page elements via UIA | Chromium exposes limited web content in UIA | Use OCR or screenshot + vision for web page content; UIA works well for browser chrome (toolbar, tabs) |
+| Can't find web page elements via UIA | Chromium exposes limited web content in UIA | Use `launch_app(command=["google-chrome", url])` to launch with `--force-renderer-accessibility`; or use OCR/vision for web content |
 | Screenshots are too large (tokens) | Default PNG at full resolution | Use `image_format="webp", quality=50` |
 | Too many UI elements (tokens) | Unfiltered UI tree includes passive containers | Use `interactable_only=true`, `role_filter`, `name_filter` |
 | OCR output too large / truncated | Full-screen OCR returns 60K+ chars | Use `ocr_text_filter="search term"` to filter server-side |

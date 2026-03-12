@@ -2398,6 +2398,357 @@ def get_app_info(
 
 
 @mcp.tool()
+def kill_process(
+    process_name: str = None,
+    pid: int = None,
+    force: bool = False,
+) -> str:
+    """Kill/terminate a running process.
+
+    Args:
+        process_name: Process name to kill, e.g. "chrome.exe", "firefox". Kills ALL matching processes.
+        pid: Specific process ID to kill. Takes priority over process_name.
+        force: Force kill (SIGKILL / taskkill /F). Default False = graceful termination.
+
+    Returns:
+        JSON: {"killed": bool, "details": str}
+    """
+    try:
+        if not process_name and not pid:
+            return json.dumps({"error": "Provide either process_name or pid"})
+
+        if sys.platform == "win32":
+            cmd = ["taskkill"]
+            if force:
+                cmd.append("/F")
+            if pid:
+                cmd.extend(["/PID", str(pid)])
+            elif process_name:
+                cmd.extend(["/IM", process_name])
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+            output = (result.stdout.decode("utf-8", errors="replace") +
+                      result.stderr.decode("utf-8", errors="replace")).strip()
+            return json.dumps({
+                "killed": result.returncode == 0,
+                "details": output,
+            })
+        else:
+            # Linux/macOS
+            if pid:
+                import signal
+                sig = signal.SIGKILL if force else signal.SIGTERM
+                os.kill(pid, sig)
+                return json.dumps({"killed": True, "details": f"Sent {'SIGKILL' if force else 'SIGTERM'} to PID {pid}"})
+            elif process_name:
+                cmd = ["killall"]
+                if force:
+                    cmd.append("-9")
+                cmd.append(process_name)
+                result = subprocess.run(cmd, capture_output=True, timeout=10)
+                output = (result.stdout.decode("utf-8", errors="replace") +
+                          result.stderr.decode("utf-8", errors="replace")).strip()
+                return json.dumps({
+                    "killed": result.returncode == 0,
+                    "details": output or f"killall {process_name}",
+                })
+    except ProcessLookupError:
+        return json.dumps({"killed": False, "details": f"Process not found: {pid or process_name}"})
+    except PermissionError:
+        return json.dumps({"killed": False, "details": f"Permission denied killing {pid or process_name}. May need admin/root."})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def list_processes(
+    name_filter: str = None,
+    sort_by: str = "memory",
+    limit: int = 20,
+) -> str:
+    """List running processes with optional filtering and sorting.
+
+    Args:
+        name_filter: Filter by process name (case-insensitive substring match).
+                     Pipe-separated for multiple: "chrome|edge|firefox"
+        sort_by: Sort order - "memory" (default, highest first), "cpu", "name", "pid"
+        limit: Max number of results to return (default 20)
+
+    Returns:
+        JSON: {"process_count": int, "processes": [{"pid", "name", "memory_mb", ...}]}
+    """
+    try:
+        processes = []
+
+        if sys.platform == "win32":
+            # tasklist /FO CSV /NH (no /V — /V is extremely slow on Windows)
+            # Output: Name, PID, Session Name, Session#, Mem Usage
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True, timeout=15,
+            )
+            for line in result.stdout.decode("utf-8", errors="replace").strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.strip('"').split('","')
+                if len(parts) >= 5:
+                    try:
+                        name = parts[0]
+                        pid_val = int(parts[1])
+                        mem_str = parts[4].replace(",", "").replace(" K", "").replace(" ", "")
+                        mem_kb = int(mem_str) if mem_str.isdigit() else 0
+                        processes.append({
+                            "pid": pid_val,
+                            "name": name,
+                            "memory_mb": round(mem_kb / 1024, 1),
+                        })
+                    except (ValueError, IndexError):
+                        continue
+        else:
+            # Linux/macOS: ps aux
+            result = subprocess.run(
+                ["ps", "aux", "--sort=-rss"],
+                capture_output=True, timeout=15,
+            )
+            lines = result.stdout.decode("utf-8", errors="replace").strip().split("\n")
+            for line in lines[1:]:  # Skip header
+                parts = line.split()
+                if len(parts) >= 11:
+                    try:
+                        processes.append({
+                            "pid": int(parts[1]),
+                            "name": parts[10],
+                            "memory_mb": round(int(parts[5]) / 1024, 1) if parts[5].isdigit() else 0,
+                            "cpu_percent": float(parts[2]) if parts[2].replace(".", "").isdigit() else 0,
+                            "command": " ".join(parts[10:])[:100],
+                        })
+                    except (ValueError, IndexError):
+                        continue
+
+        # Filter
+        if name_filter:
+            terms = [t.strip().lower() for t in name_filter.split("|")]
+            processes = [p for p in processes if any(t in p["name"].lower() for t in terms)]
+
+        # Deduplicate by PID
+        seen = set()
+        unique = []
+        for p in processes:
+            if p["pid"] not in seen:
+                seen.add(p["pid"])
+                unique.append(p)
+        processes = unique
+
+        # Sort
+        if sort_by == "memory":
+            processes.sort(key=lambda p: p.get("memory_mb", 0), reverse=True)
+        elif sort_by == "cpu":
+            processes.sort(key=lambda p: p.get("cpu_percent", 0), reverse=True)
+        elif sort_by == "name":
+            processes.sort(key=lambda p: p.get("name", "").lower())
+        elif sort_by == "pid":
+            processes.sort(key=lambda p: p.get("pid", 0))
+
+        processes = processes[:limit]
+
+        return json.dumps({
+            "process_count": len(processes),
+            "processes": processes,
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_system_info() -> str:
+    """Get system diagnostics: OS, CPU, RAM, disk usage, uptime, display info.
+
+    Returns:
+        JSON with system information including:
+        - os: name, version, architecture
+        - cpu: cores (physical + logical), max speed, current usage percent
+        - memory: total, available, used, percent
+        - disks: each drive's total, used, free, percent
+        - display: screen resolution(s)
+        - uptime: system uptime
+    """
+    import platform
+
+    info = {}
+
+    # OS info
+    info["os"] = {
+        "system": platform.system(),
+        "release": platform.release(),
+        "version": platform.version(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+    }
+    if sys.platform == "win32":
+        info["os"]["edition"] = platform.win32_edition() if hasattr(platform, "win32_edition") else ""
+
+    # Helper for PowerShell JSON queries (Windows fallback when psutil unavailable)
+    def _ps_json(command: str):
+        """Run a PowerShell command that outputs JSON and return parsed result."""
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                capture_output=True, timeout=15,
+            )
+            text = result.stdout.decode("utf-8", errors="replace").strip()
+            if text:
+                return json.loads(text)
+        except Exception:
+            pass
+        return None
+
+    # CPU info
+    cpu_info = {"logical_cores": os.cpu_count()}
+    try:
+        import psutil
+        cpu_info["physical_cores"] = psutil.cpu_count(logical=False)
+        cpu_info["usage_percent"] = psutil.cpu_percent(interval=0.5)
+        freq = psutil.cpu_freq()
+        if freq:
+            cpu_info["max_speed_mhz"] = round(freq.max, 0) if freq.max else None
+            cpu_info["current_speed_mhz"] = round(freq.current, 0) if freq.current else None
+    except ImportError:
+        if sys.platform == "win32":
+            data = _ps_json(
+                "Get-CimInstance Win32_Processor | Select-Object NumberOfCores,MaxClockSpeed,LoadPercentage | ConvertTo-Json"
+            )
+            if data:
+                cpu_info["physical_cores"] = data.get("NumberOfCores")
+                cpu_info["max_speed_mhz"] = data.get("MaxClockSpeed")
+                cpu_info["usage_percent"] = data.get("LoadPercentage")
+    info["cpu"] = cpu_info
+
+    # Memory info
+    mem_info = {}
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        mem_info = {
+            "total_gb": round(mem.total / (1024 ** 3), 1),
+            "available_gb": round(mem.available / (1024 ** 3), 1),
+            "used_gb": round(mem.used / (1024 ** 3), 1),
+            "percent_used": mem.percent,
+        }
+    except ImportError:
+        if sys.platform == "win32":
+            data = _ps_json(
+                "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json"
+            )
+            if data:
+                total_kb = data.get("TotalVisibleMemorySize", 0)
+                free_kb = data.get("FreePhysicalMemory", 0)
+                if total_kb:
+                    mem_info = {
+                        "total_gb": round(total_kb / (1024 * 1024), 1),
+                        "available_gb": round(free_kb / (1024 * 1024), 1),
+                        "used_gb": round((total_kb - free_kb) / (1024 * 1024), 1),
+                        "percent_used": round((total_kb - free_kb) / total_kb * 100, 1),
+                    }
+    info["memory"] = mem_info
+
+    # Disk info
+    disks = []
+    try:
+        import psutil
+        for part in psutil.disk_partitions(all=False):
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+                disks.append({
+                    "device": part.device,
+                    "mountpoint": part.mountpoint,
+                    "filesystem": part.fstype,
+                    "total_gb": round(usage.total / (1024 ** 3), 1),
+                    "used_gb": round(usage.used / (1024 ** 3), 1),
+                    "free_gb": round(usage.free / (1024 ** 3), 1),
+                    "percent_used": usage.percent,
+                })
+            except (PermissionError, OSError):
+                continue
+    except ImportError:
+        if sys.platform == "win32":
+            data = _ps_json(
+                "Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID,FileSystem,Size,FreeSpace | ConvertTo-Json"
+            )
+            if data:
+                # Single disk returns dict, multiple returns list
+                if isinstance(data, dict):
+                    data = [data]
+                for d in data:
+                    total = d.get("Size", 0) or 0
+                    free = d.get("FreeSpace", 0) or 0
+                    if total > 0:
+                        disks.append({
+                            "device": d.get("DeviceID", ""),
+                            "filesystem": d.get("FileSystem", ""),
+                            "total_gb": round(total / (1024 ** 3), 1),
+                            "free_gb": round(free / (1024 ** 3), 1),
+                            "used_gb": round((total - free) / (1024 ** 3), 1),
+                            "percent_used": round((total - free) / total * 100, 1),
+                        })
+    info["disks"] = disks
+
+    # Display info
+    try:
+        monitors = []
+        with mss.mss() as sct:
+            for i, mon in enumerate(sct.monitors):
+                if i == 0:
+                    continue  # Skip the "all monitors" virtual screen
+                monitors.append({
+                    "monitor": i,
+                    "width": mon["width"],
+                    "height": mon["height"],
+                    "x": mon["left"],
+                    "y": mon["top"],
+                })
+        info["display"] = {
+            "monitor_count": len(monitors),
+            "monitors": monitors,
+        }
+    except Exception:
+        pass
+
+    # Uptime
+    try:
+        import psutil
+        boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
+        uptime = datetime.datetime.now() - boot_time
+        days = uptime.days
+        hours, remainder = divmod(uptime.seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+        info["uptime"] = {
+            "boot_time": boot_time.isoformat(),
+            "uptime_str": f"{days}d {hours}h {minutes}m",
+        }
+    except ImportError:
+        if sys.platform == "win32":
+            try:
+                # Windows uptime via GetTickCount64
+                kernel32 = ctypes.windll.kernel32
+                tick_ms = kernel32.GetTickCount64()
+                uptime_s = tick_ms // 1000
+                days = uptime_s // 86400
+                hours = (uptime_s % 86400) // 3600
+                minutes = (uptime_s % 3600) // 60
+                info["uptime"] = {"uptime_str": f"{days}d {hours}h {minutes}m"}
+            except Exception:
+                pass
+
+    # Network hostname
+    info["hostname"] = platform.node()
+
+    # Python version (useful for debugging)
+    info["python_version"] = platform.python_version()
+
+    return json.dumps(info)
+
+
+@mcp.tool()
 def wait_milliseconds(milliseconds: int) -> str:
     """
     Wait for a specified number of milliseconds.
