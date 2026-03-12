@@ -32,8 +32,12 @@ No single source captures everything on screen. Use the right combination:
 | See what's on screen | `take_screenshot_full` | `image_format="webp", quality=50` |
 | Find a button/field to click | `take_screenshot_with_ui_automation` | `interactable_only=true` |
 | Find specific UI elements | `take_screenshot_with_ui_automation` | `name_filter`, `role_filter` |
-| Read text on screen | `take_screenshot_with_ocr` | |
+| Read text on screen | `take_screenshot_with_ocr` | `ocr_text_filter` for targeted search |
+| Find specific text (like grep) | `take_screenshot_with_ocr` | `ocr_text_filter="mem4\|mem 4"` |
+| Find text to click | `find_text` | `text="Submit\|OK"` with pipe-separated OR |
 | Click something | `click_screen` | `x, y` from UI automation or OCR |
+| Right-click something | `click_screen` | `button="right"` |
+| Double-click (open files/icons) | `click_screen` | `num_clicks=2` |
 | Type into a field | `click_screen` → `type_text` | Click the field first, then type |
 | Scroll a page | `scroll` | `title_pattern` to activate first |
 | Bring a window to front | `activate_window` | `title_pattern` |
@@ -225,6 +229,72 @@ take_screenshot_with_ui_automation(
 
 ---
 
+## OCR Text Filter (grep for the screen)
+
+### The problem
+
+A full-screen OCR dump returns **60,000+ characters** — way too much for an agent to process. Most of the time you only need one or two text elements.
+
+### The solution: `ocr_text_filter`
+
+All OCR tools support server-side filtering with fuzzy matching and pipe-separated OR terms:
+
+```
+# Find "mem4" on screen — returns only matching elements
+take_screenshot_with_ocr(ocr_text_filter="mem4|mem 4")
+
+# Same filter works in take_screenshot_full
+take_screenshot_full(
+    include_image=false, include_ui=false, include_ocr=true,
+    ocr_text_filter="VLC|vlc media"
+)
+
+# find_text also supports pipe-separated terms
+find_text(text="Submit|OK|Save")
+```
+
+### How it works
+
+- Each OCR result is scored against **every** search term using fuzzy matching (`fuzz.partial_ratio`)
+- A length penalty prevents short garbage matches from scoring high
+- Results are sorted by **best match score** descending
+- Only results above `ocr_match_threshold` (default 60) are returned
+- Each result includes a `match_score` field
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ocr_text_filter` | `None` (returns all) | Pipe-separated search terms, e.g. `"mem4\|mem 4\|mem_4"` |
+| `ocr_match_threshold` | `60` | Minimum score (0-100). Lower = more results, higher = stricter |
+
+### Impact on response size
+
+| Scenario | Without filter | With filter | Reduction |
+|----------|---------------|-------------|-----------|
+| Full screen OCR | ~61,000 chars | ~2,000 chars | **97%** |
+| Window OCR | ~15,000 chars | ~500 chars | **96%** |
+
+### When to use which OCR approach
+
+| Scenario | Tool & approach |
+|----------|----------------|
+| **Find specific text to click** | `take_screenshot_with_ocr(ocr_text_filter="Submit\|OK")` → `click_screen(abs_center_x, abs_center_y)` |
+| **Open a desktop icon** | `take_screenshot_with_ocr(ocr_text_filter="VLC\|Chrome")` → `click_screen(..., num_clicks=2)` |
+| **Read all text on screen** | `take_screenshot_with_ocr()` (no filter — returns everything) |
+| **Combined: see screen + find text** | `take_screenshot_full(include_ocr=true, ocr_text_filter="Search")` |
+| **Text + UI combined search** | `take_screenshot_full(include_ocr=true, ocr_text_filter="...", ui_name_filter="...")` |
+
+### Best practices
+
+- **Always use a filter** when searching for specific text — the unfiltered response is too large
+- Use **pipe-separated terms** when you're unsure of exact spelling: `"Settings|Setting|Settngs"`
+- **Lower the threshold** to 40-50 if you get no results — OCR may have slight misreadings
+- The filter uses **fuzzy matching** so minor OCR errors (like `l` vs `1`, `O` vs `0`) still match
+- Prefer `take_screenshot_with_ocr` with filter over `find_text` — same OCR engine but more flexible output format
+
+---
+
 ## Common Workflows
 
 ### Navigate a Browser to a URL
@@ -263,6 +333,31 @@ take_screenshot_with_ui_automation(
 3. take_screenshot_full(...)
    → See what's visible now
 4. Repeat as needed
+```
+
+### Open a Desktop Icon
+
+```
+1. press_keys("win+d")                                    → show desktop
+2. take_screenshot_with_ocr(ocr_text_filter="VLC|Chrome")  → find the icon label
+   → Get abs_center_x, abs_center_y of the top match
+3. click_screen(x=<x>, y=<y>, num_clicks=2)               → double-click to open
+4. take_screenshot_full(...)                                → verify app opened
+```
+
+**Why OCR works best for desktop icons:**
+- Desktop icons are not well-exposed by UI automation (they're in a special shell ListView)
+- OCR reads icon labels with 99%+ confidence
+- With `ocr_text_filter`, the response is tiny (~500 bytes) and the top match has exact coordinates
+- This is a 2-call workflow: OCR filter → double-click
+
+### Right-Click Context Menu
+
+```
+1. click_screen(x=<x>, y=<y>, button="right")             → right-click target
+2. take_screenshot_with_ui_automation(name_filter="Copy|Paste|Delete|Properties")
+   → Find menu items
+3. click_screen(x=<item_x>, y=<item_y>)                   → click menu item
 ```
 
 ### Handle Dialogs/Popups
@@ -388,6 +483,7 @@ the universal fallback for any coordinate-based interaction.
 - Works well for reading text, but coordinates can be slightly off for small text.
 - Returns text lines/phrases (not individual words) — good for clicking text targets.
 - Does not work on text inside images that are too small or low-contrast.
+- **Always use `ocr_text_filter`** when searching for specific text — unfiltered full-screen OCR returns 60K+ chars that may get truncated.
 
 ### Coordinate Accuracy
 
@@ -404,6 +500,7 @@ the universal fallback for any coordinate-based interaction.
 - Disable OCR (`include_ocr=false`) when UI automation is sufficient — saves 1-20 seconds.
 - Use `interactable_only=true` to cut UI element count by ~70%.
 - Use `name_filter` / `role_filter` for targeted searches instead of parsing full UI trees.
+- Use `ocr_text_filter` to search OCR results server-side — 97% smaller responses than unfiltered OCR.
 - Use `webp` format with `quality=50` — 5x smaller than default PNG with no visible loss.
 - For repeated screenshots of the same window, the window matching is cached — subsequent calls are faster.
 
@@ -419,3 +516,6 @@ the universal fallback for any coordinate-based interaction.
 | Can't find web page elements via UIA | Chromium exposes limited web content in UIA | Use OCR or screenshot + vision for web page content; UIA works well for browser chrome (toolbar, tabs) |
 | Screenshots are too large (tokens) | Default PNG at full resolution | Use `image_format="webp", quality=50` |
 | Too many UI elements (tokens) | Unfiltered UI tree includes passive containers | Use `interactable_only=true`, `role_filter`, `name_filter` |
+| OCR output too large / truncated | Full-screen OCR returns 60K+ chars | Use `ocr_text_filter="search term"` to filter server-side |
+| OCR filter returns no results | Threshold too high or OCR misread the text | Lower `ocr_match_threshold` to 40, try alternate spellings with `\|` |
+| Can't find desktop icon via UIA | Desktop icons use shell ListView, poorly exposed | Use `take_screenshot_with_ocr(ocr_text_filter="icon name")` + `click_screen(num_clicks=2)` |
