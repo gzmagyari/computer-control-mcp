@@ -6,6 +6,7 @@ using PyAutoGUI for mouse/keyboard control.
 """
 
 import json
+import ctypes
 import shutil
 import sys
 import os
@@ -767,6 +768,72 @@ def _set_clipboard(text: str) -> None:
         raise RuntimeError("Clipboard operation timed out")
 
 
+def _get_clipboard() -> str:
+    """Get the system clipboard text. Cross-platform (Windows/Linux).
+
+    Returns:
+        Clipboard text content.
+
+    Raises:
+        RuntimeError: If clipboard operation fails.
+    """
+    try:
+        if sys.platform == "win32":
+            process = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                    "$text = Get-Clipboard -Raw; "
+                    "if ($null -ne $text) { [Console]::Write($text) }",
+                ],
+                capture_output=True,
+                timeout=5,
+            )
+            if process.returncode != 0:
+                raise RuntimeError(f"PowerShell clipboard failed: {process.stderr}")
+            return process.stdout.decode("utf-8", errors="replace")
+        else:
+            # Linux: try xclip first, fall back to xsel
+            try:
+                result = subprocess.run(
+                    ["xclip", "-selection", "clipboard", "-o"],
+                    capture_output=True,
+                    timeout=5,
+                    check=True,
+                )
+                return result.stdout.decode("utf-8", errors="replace")
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                result = subprocess.run(
+                    ["xsel", "--clipboard", "--output"],
+                    capture_output=True,
+                    timeout=5,
+                    check=True,
+                )
+                return result.stdout.decode("utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Clipboard read operation timed out")
+
+
+def _get_window_obj(title_pattern: str, use_regex: bool = False, threshold: int = 60):
+    """Find and return a window object by title pattern.
+
+    Returns:
+        Tuple of (window_obj, error_message). One will be None.
+    """
+    all_windows = gw.getAllWindows()
+    windows = []
+    for window in all_windows:
+        if window.title:
+            windows.append({"title": window.title, "window_obj": window})
+
+    matched = _find_matching_window(windows, title_pattern, use_regex, threshold)
+    if not matched:
+        return None, f"Error: No window found matching pattern: {title_pattern}"
+    return matched["window_obj"], None
+
+
 def _find_matching_window(
     windows: any,
     title_pattern: str = None,
@@ -851,6 +918,33 @@ def get_screen_size() -> Dict[str, Any]:
         }
     except Exception as e:
         return {"error": str(e), "message": f"Error getting screen size: {str(e)}"}
+
+
+@mcp.tool()
+def get_monitors() -> str:
+    """List all monitors with their positions and dimensions. Useful for multi-monitor setups.
+
+    Returns:
+        JSON array of monitors: index, left, top, width, height, is_primary, is_virtual_desktop.
+        Index 0 is the virtual desktop (all monitors combined). Index 1+ are individual monitors.
+    """
+    try:
+        import mss as mss_module
+        with mss_module.mss() as sct:
+            monitors = []
+            for i, m in enumerate(sct.monitors):
+                monitors.append({
+                    "index": i,
+                    "left": m["left"],
+                    "top": m["top"],
+                    "width": m["width"],
+                    "height": m["height"],
+                    "is_primary": i == 1,
+                    "is_virtual_desktop": i == 0,
+                })
+            return json.dumps(monitors)
+    except Exception as e:
+        return f"Error getting monitors: {str(e)}"
 
 
 @mcp.tool()
@@ -1807,6 +1901,103 @@ def capture_region_around(
 
 
 @mcp.tool()
+def hover_and_capture(
+    x: int,
+    y: int,
+    wait_ms: int = 500,
+    radius: int = 150,
+    include_ocr: bool = False,
+    image_format: str = "webp",
+    quality: int = 50,
+    ocr_text_filter: str = None,
+) -> list:
+    """Move mouse to coordinates, wait for tooltip/hover content to appear, then capture the area.
+    Combines move_mouse + wait + capture_region_around + optional OCR in one call.
+
+    Args:
+        x: Screen X coordinate to hover over.
+        y: Screen Y coordinate to hover over.
+        wait_ms: How long to hover before capturing (ms). Default 500 (enough for most tooltips).
+        radius: Half-size of capture region in pixels. Default 150 (captures 300x300 area).
+        include_ocr: If True, run OCR on the captured region to read tooltip text.
+        image_format: Output format — "png", "webp", or "jpeg". Default "webp".
+        quality: Compression quality 1-100 for webp/jpeg. Default 50.
+        ocr_text_filter: Optional OCR text filter (pipe-separated). Only applies when include_ocr=True.
+
+    Returns:
+        List of [info_text, Image] and optionally OCR results in the info_text JSON.
+    """
+    try:
+        # Move mouse to target
+        pyautogui.moveTo(x=x, y=y)
+
+        # Wait for hover content to appear
+        time.sleep(wait_ms / 1000.0)
+
+        # Capture region
+        screen_width, screen_height = pyautogui.size()
+        left = max(x - radius, 0)
+        top = max(y - radius, 0)
+        right = min(x + radius, screen_width)
+        bottom = min(y + radius, screen_height)
+        cap_width = right - left
+        cap_height = bottom - top
+
+        if cap_width <= 0 or cap_height <= 0:
+            return f"Invalid region: coordinates ({x}, {y}) with radius {radius} result in empty capture area."
+
+        screenshot = _mss_screenshot(region=(left, top, cap_width, cap_height))
+        ocr_source = screenshot.copy() if include_ocr else None
+
+        # Prescale
+        orig_w, orig_h = screenshot.size
+        screenshot, scale_factor = _prescale_for_agent(screenshot)
+        scaled_w, scaled_h = screenshot.size
+
+        # Process image
+        img_bytes, fmt = _process_image_for_output(
+            screenshot, image_format=image_format, quality=quality, color_mode="color",
+        )
+        image = Image(data=img_bytes, format=fmt)
+
+        info = {
+            "hover_position": {"x": x, "y": y},
+            "capture_region": {"left": left, "top": top, "width": cap_width, "height": cap_height},
+            "scale_factor": round(scale_factor, 4),
+            "size": f"{scaled_w}x{scaled_h}",
+        }
+
+        # Optional OCR on the region
+        if include_ocr:
+            np_array = np.array(ocr_source)
+            cv2_img = cv2.cvtColor(np_array, cv2.COLOR_RGB2BGR)
+            output = engine(cv2_img)
+            if output.boxes is not None and output.txts is not None:
+                ocr_elements = []
+                for box, text_val, score in zip(output.boxes, output.txts, output.scores):
+                    box_list = box.tolist() if hasattr(box, 'tolist') else box
+                    abs_cx = int(sum(p[0] for p in box_list) / 4) + left
+                    abs_cy = int(sum(p[1] for p in box_list) / 4) + top
+                    ocr_elements.append({
+                        "text": text_val,
+                        "confidence": round(float(score), 4),
+                        "abs_center_x": abs_cx,
+                        "abs_center_y": abs_cy,
+                    })
+                if ocr_text_filter:
+                    ocr_elements = _filter_ocr_elements(ocr_elements, ocr_text_filter)
+                info["ocr"] = {"elements": ocr_elements, "element_count": len(ocr_elements)}
+            else:
+                info["ocr"] = {"elements": [], "element_count": 0}
+
+        return [json.dumps(info), image]
+
+    except Exception as e:
+        log(f"Error in hover_and_capture: {str(e)}")
+        return f"Error in hover_and_capture: {str(e)}"
+
+
+@mcp.tool()
 def launch_app(
     command: list,
     family: str = "auto",
@@ -2018,6 +2209,195 @@ def list_windows() -> List[Dict[str, Any]]:
 
 
 @mcp.tool()
+def is_app_running(process_name: str) -> str:
+    """Check if a process/application is currently running.
+
+    Args:
+        process_name: Process name to search for, e.g. "chrome.exe", "firefox", "code".
+                      Partial matches are supported (case-insensitive).
+
+    Returns:
+        JSON: {"running": bool, "matches": [{"pid": int, "name": str}, ...]}
+    """
+    try:
+        matches = []
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True, timeout=10,
+            )
+            for line in result.stdout.decode("utf-8", errors="replace").strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.strip('"').split('","')
+                if len(parts) >= 2:
+                    name = parts[0]
+                    pid = parts[1]
+                    if process_name.lower() in name.lower():
+                        try:
+                            matches.append({"pid": int(pid), "name": name})
+                        except ValueError:
+                            pass
+        else:
+            # Linux/macOS: use ps
+            result = subprocess.run(
+                ["ps", "aux"],
+                capture_output=True, timeout=10,
+            )
+            for line in result.stdout.decode("utf-8", errors="replace").strip().split("\n")[1:]:
+                if process_name.lower() in line.lower():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            matches.append({"pid": int(parts[1]), "name": " ".join(parts[10:])})
+                        except (ValueError, IndexError):
+                            pass
+
+        # Deduplicate by PID
+        seen_pids = set()
+        unique = []
+        for m in matches:
+            if m["pid"] not in seen_pids:
+                seen_pids.add(m["pid"])
+                unique.append(m)
+
+        return json.dumps({
+            "running": len(unique) > 0,
+            "match_count": len(unique),
+            "matches": unique[:20],  # Limit output
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_app_info(
+    process_name: str = None,
+    pid: int = None,
+) -> str:
+    """Get detailed info about a running process — memory usage, status, command line, associated windows.
+
+    Args:
+        process_name: Process name to look up (e.g. "chrome.exe"). Uses first match.
+        pid: Process ID. Takes priority over process_name if both provided.
+
+    Returns:
+        JSON with process details: pid, name, memory_mb, status, windows, etc.
+    """
+    try:
+        if not process_name and not pid:
+            return json.dumps({"error": "Provide either process_name or pid"})
+        if process_name is not None and not str(process_name).strip():
+            return json.dumps({"error": "process_name must not be empty"})
+
+        info = {}
+
+        # Direct PID lookup via psutil (fast — no iteration)
+        if pid is not None:
+            try:
+                import psutil
+                proc = psutil.Process(pid)
+                with proc.oneshot():
+                    info = {
+                        "pid": proc.pid,
+                        "name": proc.name(),
+                        "memory_mb": round(proc.memory_info().rss / (1024 * 1024), 1),
+                        "status": proc.status(),
+                        "command_line": " ".join(proc.cmdline() or []),
+                    }
+            except Exception:
+                pass  # Fall through to shell-based lookup
+
+        # Name-based lookup: use fast shell commands (NOT psutil.process_iter which is very slow)
+        if not info and sys.platform == "win32":
+            if pid and not process_name:
+                # PID lookup via tasklist
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/V"],
+                    capture_output=True, timeout=10,
+                )
+            else:
+                # Name lookup via tasklist
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"IMAGENAME eq {process_name}", "/FO", "CSV", "/V"],
+                    capture_output=True, timeout=10,
+                )
+            output = result.stdout.decode("utf-8", errors="replace").strip()
+            lines = [l.strip() for l in output.split("\n") if l.strip()]
+            # tasklist /V /FO CSV headers: "Image Name","PID","Session Name","Session#","Mem Usage","Status","User Name","CPU Time","Window Title"
+            if len(lines) >= 2 and "No tasks" not in lines[0] and "INFO:" not in lines[0]:
+                headers = [h.strip('"') for h in lines[0].split('","')]
+                # Find first matching line (skip header)
+                for data_line in lines[1:]:
+                    values = [v.strip('"') for v in data_line.split('","')]
+                    if len(values) >= 5:
+                        name_val = values[0] if len(values) > 0 else ""
+                        # For name-based search, verify match
+                        if process_name and process_name.lower() not in name_val.lower():
+                            continue
+                        try:
+                            mem_str = values[4].replace(",", "").replace(" K", "").replace(" ", "")
+                            mem_kb = int(mem_str) if mem_str.isdigit() else 0
+                            info = {
+                                "pid": int(values[1]),
+                                "name": name_val,
+                                "memory_mb": round(mem_kb / 1024, 1),
+                                "status": values[5] if len(values) > 5 else "",
+                                "window_title": values[8] if len(values) > 8 else "",
+                            }
+                            break
+                        except (ValueError, IndexError):
+                            continue
+
+        elif not info:
+            # Linux/macOS: use ps
+            if pid:
+                cmd = ["ps", "-p", str(pid), "-o", "pid,rss,%cpu,stat,comm,args", "--no-headers"]
+                result = subprocess.run(cmd, capture_output=True, timeout=10)
+                output = result.stdout.decode("utf-8", errors="replace").strip()
+                if output:
+                    parts = output.split()
+                    info = {
+                        "pid": int(parts[0]) if parts else pid,
+                        "memory_mb": round(int(parts[1]) / 1024, 1) if len(parts) > 1 and parts[1].isdigit() else 0,
+                        "cpu_percent": float(parts[2]) if len(parts) > 2 and parts[2].replace(".", "").isdigit() else 0,
+                        "name": parts[4] if len(parts) > 4 else "",
+                        "command_line": " ".join(parts[5:]) if len(parts) > 5 else "",
+                    }
+            else:
+                result = subprocess.run(["ps", "aux"], capture_output=True, timeout=10)
+                for line in result.stdout.decode("utf-8", errors="replace").split("\n"):
+                    if process_name.lower() in line.lower() and "grep" not in line:
+                        parts = line.split()
+                        if len(parts) >= 6:
+                            info = {
+                                "pid": int(parts[1]),
+                                "name": parts[10] if len(parts) > 10 else "",
+                                "memory_mb": round(int(parts[5]) / 1024, 1) if parts[5].isdigit() else 0,
+                                "cpu_percent": float(parts[2]) if parts[2].replace(".", "").isdigit() else 0,
+                                "command_line": " ".join(parts[10:]),
+                            }
+                            break
+
+        if not info:
+            return json.dumps({"error": f"Process not found: {process_name or pid}"})
+
+        # Visible windows hint only; this is not a reliable PID->window mapping.
+        target_pid = info.get("pid")
+        if target_pid:
+            associated_windows = []
+            for w in gw.getAllWindows():
+                if w.title and w.visible:
+                    associated_windows.append(w.title)
+            info["visible_windows_hint"] = associated_windows[:10]
+
+        return json.dumps(info)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
 def wait_milliseconds(milliseconds: int) -> str:
     """
     Wait for a specified number of milliseconds.
@@ -2053,6 +2433,23 @@ def set_clipboard(text: str) -> str:
         return f"Clipboard set to: '{preview}'"
     except Exception as e:
         return f"Error setting clipboard: {str(e)}"
+
+
+@mcp.tool()
+def get_clipboard() -> str:
+    """Read the current system clipboard text. Cross-platform (Windows/Linux).
+    Use after Ctrl+C to extract copied text for processing.
+
+    Returns:
+        The clipboard text content, or error message.
+    """
+    try:
+        text = _get_clipboard()
+        if not text:
+            return json.dumps({"text": "", "length": 0, "message": "Clipboard is empty"})
+        return json.dumps({"text": text, "length": len(text)})
+    except Exception as e:
+        return f"Error reading clipboard: {str(e)}"
 
 
 @mcp.tool()
@@ -2106,6 +2503,247 @@ def activate_window(
     except Exception as e:
         log(f"Error activating window: {str(e)}")
         return f"Error activating window: {str(e)}"
+
+
+@mcp.tool()
+def minimize_window(
+    title_pattern: str, use_regex: bool = False, threshold: int = 60
+) -> str:
+    """Minimize a window to the taskbar.
+
+    Args:
+        title_pattern: Pattern to match window title.
+        use_regex: If True, treat pattern as regex.
+        threshold: Fuzzy match threshold (0-100).
+    """
+    try:
+        window, err = _get_window_obj(title_pattern, use_regex, threshold)
+        if err:
+            return err
+        if sys.platform == "win32":
+            hwnd = window._hWnd
+            ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+        else:
+            window.minimize()
+        return f"Successfully minimized window: '{window.title}'"
+    except Exception as e:
+        return f"Error minimizing window: {str(e)}"
+
+
+@mcp.tool()
+def maximize_window(
+    title_pattern: str, use_regex: bool = False, threshold: int = 60
+) -> str:
+    """Maximize a window to fill the screen.
+
+    Args:
+        title_pattern: Pattern to match window title.
+        use_regex: If True, treat pattern as regex.
+        threshold: Fuzzy match threshold (0-100).
+    """
+    try:
+        window, err = _get_window_obj(title_pattern, use_regex, threshold)
+        if err:
+            return err
+        _force_activate_window(window)
+        if sys.platform == "win32":
+            hwnd = window._hWnd
+            ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+        else:
+            window.maximize()
+        return f"Successfully maximized window: '{window.title}'"
+    except Exception as e:
+        return f"Error maximizing window: {str(e)}"
+
+
+@mcp.tool()
+def restore_window(
+    title_pattern: str, use_regex: bool = False, threshold: int = 60
+) -> str:
+    """Restore a window from minimized or maximized state to its normal size.
+
+    Args:
+        title_pattern: Pattern to match window title.
+        use_regex: If True, treat pattern as regex.
+        threshold: Fuzzy match threshold (0-100).
+    """
+    try:
+        window, err = _get_window_obj(title_pattern, use_regex, threshold)
+        if err:
+            return err
+        if sys.platform == "win32":
+            hwnd = window._hWnd
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        else:
+            window.restore()
+        time.sleep(0.3)
+        return f"Successfully restored window: '{window.title}'"
+    except Exception as e:
+        return f"Error restoring window: {str(e)}"
+
+
+@mcp.tool()
+def close_window(
+    title_pattern: str, use_regex: bool = False, threshold: int = 60
+) -> str:
+    """Close a window. Use with caution — may cause unsaved data loss.
+
+    Args:
+        title_pattern: Pattern to match window title.
+        use_regex: If True, treat pattern as regex.
+        threshold: Fuzzy match threshold (0-100).
+    """
+    try:
+        window, err = _get_window_obj(title_pattern, use_regex, threshold)
+        if err:
+            return err
+        title = window.title
+        if sys.platform == "win32":
+            hwnd = window._hWnd
+            WM_CLOSE = 0x0010
+            ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        else:
+            window.close()
+        return f"Successfully sent close to window: '{title}'"
+    except Exception as e:
+        return f"Error closing window: {str(e)}"
+
+
+@mcp.tool()
+def resize_window(
+    title_pattern: str,
+    width: int,
+    height: int,
+    use_regex: bool = False,
+    threshold: int = 60,
+) -> str:
+    """Resize a window to the specified dimensions.
+
+    Args:
+        title_pattern: Pattern to match window title.
+        width: New width in pixels.
+        height: New height in pixels.
+        use_regex: If True, treat pattern as regex.
+        threshold: Fuzzy match threshold (0-100).
+    """
+    try:
+        if width <= 0 or height <= 0:
+            return f"Error: width and height must be > 0, got {width}x{height}"
+        window, err = _get_window_obj(title_pattern, use_regex, threshold)
+        if err:
+            return err
+        _force_activate_window(window)
+        if sys.platform == "win32":
+            hwnd = window._hWnd
+            # Restore first if maximized, otherwise resize won't work
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            time.sleep(0.2)
+            # Get current position to preserve it
+            from ctypes import wintypes
+            rect = wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            ctypes.windll.user32.MoveWindow(hwnd, rect.left, rect.top, width, height, True)
+        else:
+            window.resizeTo(width, height)
+        return f"Successfully resized window '{window.title}' to {width}x{height}"
+    except Exception as e:
+        return f"Error resizing window: {str(e)}"
+
+
+@mcp.tool()
+def move_window(
+    title_pattern: str,
+    x: int,
+    y: int,
+    use_regex: bool = False,
+    threshold: int = 60,
+) -> str:
+    """Move a window to the specified screen position.
+
+    Args:
+        title_pattern: Pattern to match window title.
+        x: New X position (left edge) in pixels.
+        y: New Y position (top edge) in pixels.
+        use_regex: If True, treat pattern as regex.
+        threshold: Fuzzy match threshold (0-100).
+    """
+    try:
+        window, err = _get_window_obj(title_pattern, use_regex, threshold)
+        if err:
+            return err
+        _force_activate_window(window)
+        if sys.platform == "win32":
+            hwnd = window._hWnd
+            # Restore first if maximized
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            time.sleep(0.2)
+            from ctypes import wintypes
+            rect = wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            width = rect.right - rect.left
+            height = rect.bottom - rect.top
+            ctypes.windll.user32.MoveWindow(hwnd, x, y, width, height, True)
+        else:
+            window.moveTo(x, y)
+        return f"Successfully moved window '{window.title}' to ({x}, {y})"
+    except Exception as e:
+        return f"Error moving window: {str(e)}"
+
+
+@mcp.tool()
+def snap_window(
+    title_pattern: str,
+    position: str = "left",
+    use_regex: bool = False,
+    threshold: int = 60,
+) -> str:
+    """Snap a window to a screen edge or corner, like Windows snap layouts.
+
+    Args:
+        title_pattern: Pattern to match window title.
+        position: Snap position — "left", "right", "top-left", "top-right",
+                  "bottom-left", "bottom-right". Default "left".
+        use_regex: If True, treat pattern as regex.
+        threshold: Fuzzy match threshold (0-100).
+    """
+    try:
+        window, err = _get_window_obj(title_pattern, use_regex, threshold)
+        if err:
+            return err
+        _force_activate_window(window)
+
+        screen_w, screen_h = pyautogui.size()
+        half_w = screen_w // 2
+        half_h = screen_h // 2
+
+        positions = {
+            "left": (0, 0, half_w, screen_h),
+            "right": (half_w, 0, half_w, screen_h),
+            "top-left": (0, 0, half_w, half_h),
+            "top-right": (half_w, 0, half_w, half_h),
+            "bottom-left": (0, half_h, half_w, half_h),
+            "bottom-right": (half_w, half_h, half_w, half_h),
+        }
+
+        if position not in positions:
+            return f"Error: position must be one of {list(positions.keys())}, got '{position}'"
+
+        x, y, w, h = positions[position]
+
+        if sys.platform == "win32":
+            hwnd = window._hWnd
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            time.sleep(0.2)
+            ctypes.windll.user32.MoveWindow(hwnd, x, y, w, h, True)
+        else:
+            window.restore()
+            time.sleep(0.2)
+            window.moveTo(x, y)
+            window.resizeTo(w, h)
+
+        return f"Successfully snapped window '{window.title}' to {position} ({w}x{h} at {x},{y})"
+    except Exception as e:
+        return f"Error snapping window: {str(e)}"
 
 
 @mcp.tool()
@@ -2444,6 +3082,230 @@ async def wait_for_screen_change(
 
 
 @mcp.tool()
+async def wait_for_text(
+    text: str,
+    mode: str = "appear",
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 10,
+    match_threshold: int = 70,
+    timeout_ms: int = 10000,
+    poll_interval_ms: int = 1000,
+    region: list = None,
+) -> str:
+    """Wait until specific text appears or disappears from the screen (OCR-based polling).
+    Eliminates the need for agents to build manual poll loops.
+
+    Args:
+        text: Text to search for. Supports pipe-separated OR terms, e.g. "Loading|Please wait".
+        mode: "appear" — wait until text IS found. "disappear" — wait until text is NOT found. Default "appear".
+        title_pattern: Window to watch. None = full screen.
+        use_regex: Regex mode for window matching.
+        threshold: Fuzzy match threshold for window title.
+        match_threshold: Minimum fuzzy match score (0-100) for text matching. Default 70.
+        timeout_ms: Maximum wait time in ms. Default 10000. Max 60000.
+        poll_interval_ms: Time between OCR checks in ms. Default 1000 (OCR is slow). Min 500.
+        region: Optional [x, y, w, h] to check only a specific area.
+
+    Returns:
+        JSON: {"found": bool, "elapsed_ms": int, "matches": [...], "timed_out": bool, "polls": int}
+    """
+    try:
+        timeout_ms = min(max(timeout_ms, 500), 60000)
+        poll_interval_ms = max(poll_interval_ms, 500)
+
+        if mode not in ("appear", "disappear"):
+            return json.dumps({"error": f"mode must be 'appear' or 'disappear', got '{mode}'"})
+
+        search_terms = [t.strip() for t in text.split("|") if t.strip()]
+        if not search_terms:
+            return json.dumps({"error": "text must contain at least one non-empty search term"})
+        start_time = time.monotonic()
+        polls = 0
+
+        while True:
+            polls += 1
+            # Take screenshot and run OCR
+            pil_img, np_array, key, window_obj, _, region_offset = _take_screenshot_as_array(
+                title_pattern, use_regex, threshold, activate=False, region=region
+            )
+
+            if region_offset:
+                offset_x, offset_y = region_offset
+            elif window_obj:
+                offset_x = max(window_obj.left, 0)
+                offset_y = max(window_obj.top, 0)
+            else:
+                offset_x, offset_y = 0, 0
+
+            cv2_img = cv2.cvtColor(np_array, cv2.COLOR_RGB2BGR)
+            if not window_obj and not region_offset:
+                boxes, txts, scores = _ocr_with_regions(cv2_img)
+            else:
+                output = engine(cv2_img)
+                boxes, txts, scores = output.boxes, output.txts, output.scores
+
+            # Check for matches
+            matches = []
+            if txts:
+                for i, ocr_text in enumerate(txts):
+                    best_score = 0
+                    for term in search_terms:
+                        fuzzy_score = fuzz.partial_ratio(term, ocr_text)
+                        length_ratio = min(len(term), len(ocr_text)) / max(len(term), len(ocr_text))
+                        combined = round(fuzzy_score * 0.7 + (length_ratio * 100) * 0.3)
+                        best_score = max(best_score, combined)
+                    if best_score >= match_threshold:
+                        box = boxes[i]
+                        box_list = box.tolist() if hasattr(box, 'tolist') else box
+                        abs_cx = int(sum(p[0] for p in box_list) / 4) + offset_x
+                        abs_cy = int(sum(p[1] for p in box_list) / 4) + offset_y
+                        matches.append({
+                            "text": ocr_text, "score": best_score,
+                            "abs_center_x": abs_cx, "abs_center_y": abs_cy,
+                        })
+
+            found = len(matches) > 0
+            elapsed = (time.monotonic() - start_time) * 1000
+
+            # Check if condition is met
+            if mode == "appear" and found:
+                matches.sort(key=lambda m: -m["score"])
+                return json.dumps({
+                    "found": True, "elapsed_ms": round(elapsed),
+                    "matches": matches, "timed_out": False, "polls": polls,
+                })
+            elif mode == "disappear" and not found:
+                return json.dumps({
+                    "found": False, "elapsed_ms": round(elapsed),
+                    "matches": [], "timed_out": False, "polls": polls,
+                    "message": f"Text '{text}' is no longer visible",
+                })
+
+            # Check timeout
+            if elapsed >= timeout_ms:
+                return json.dumps({
+                    "found": found, "elapsed_ms": round(elapsed),
+                    "matches": matches if found else [], "timed_out": True, "polls": polls,
+                    "message": f"Timed out waiting for text to {'appear' if mode == 'appear' else 'disappear'}",
+                })
+
+            await asyncio.sleep(poll_interval_ms / 1000.0)
+
+    except Exception as e:
+        log(f"Error in wait_for_text: {str(e)}")
+        return json.dumps({"error": str(e)})
+
+
+def _flatten_ui_result_elements(ui_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten get_ui_elements() output into a single element list."""
+    elements = []
+    for app in ui_result.get("ui_elements", {}).get("applications", []):
+        elements.extend(app.get("elements", []))
+    return elements
+
+
+@mcp.tool()
+async def wait_for_element(
+    mode: str = "appear",
+    name_filter: str = None,
+    role_filter: str = None,
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 10,
+    timeout_ms: int = 10000,
+    poll_interval_ms: int = 1000,
+) -> str:
+    """Wait until a UI automation element appears or disappears (accessibility tree polling).
+    Eliminates the need for agents to build manual poll loops for UI elements.
+
+    Args:
+        mode: "appear" — wait until element IS found. "disappear" — wait until NOT found. Default "appear".
+        name_filter: Filter by element name (pipe-separated OR). E.g. "Submit|OK|Finish".
+        role_filter: Filter by element role (pipe-separated OR). E.g. "push button|link".
+        title_pattern: App window to check. Required for UIA.
+        use_regex: Regex mode for window matching.
+        threshold: Fuzzy match threshold for window title.
+        timeout_ms: Maximum wait time in ms. Default 10000. Max 60000.
+        poll_interval_ms: Time between checks in ms. Default 1000. Min 500.
+
+    Returns:
+        JSON: {"found": bool, "elapsed_ms": int, "elements": [...], "timed_out": bool, "polls": int}
+    """
+    try:
+        timeout_ms = min(max(timeout_ms, 500), 60000)
+        poll_interval_ms = max(poll_interval_ms, 500)
+
+        if mode not in ("appear", "disappear"):
+            return json.dumps({"error": f"mode must be 'appear' or 'disappear', got '{mode}'"})
+
+        if not name_filter and not role_filter:
+            return json.dumps({"error": "At least one of name_filter or role_filter is required"})
+
+        start_time = time.monotonic()
+        polls = 0
+
+        while True:
+            polls += 1
+            try:
+                resolved_app_filter = title_pattern
+                if title_pattern:
+                    all_windows = gw.getAllWindows()
+                    windows = [{"title": w.title, "window_obj": w} for w in all_windows if w.title]
+                    matched = _find_matching_window(windows, title_pattern, use_regex, threshold)
+                    if matched:
+                        resolved_app_filter = matched["title"]
+
+                ui_result = get_ui_elements(
+                    app_filter=resolved_app_filter,
+                    name_filter=name_filter,
+                    role_filter=role_filter,
+                )
+                if not ui_result.get("available", True):
+                    element_count = 0
+                    elements = []
+                else:
+                    elements = _flatten_ui_result_elements(ui_result)
+                    element_count = ui_result.get("ui_elements", {}).get("element_count", len(elements))
+            except Exception:
+                element_count = 0
+                elements = []
+
+            found = element_count > 0
+            elapsed = (time.monotonic() - start_time) * 1000
+
+            if mode == "appear" and found:
+                return json.dumps({
+                    "found": True, "elapsed_ms": round(elapsed),
+                    "element_count": element_count,
+                    "elements": elements[:10],  # Limit to first 10
+                    "timed_out": False, "polls": polls,
+                })
+            elif mode == "disappear" and not found:
+                return json.dumps({
+                    "found": False, "elapsed_ms": round(elapsed),
+                    "element_count": 0, "elements": [],
+                    "timed_out": False, "polls": polls,
+                    "message": "Element is no longer visible",
+                })
+
+            if elapsed >= timeout_ms:
+                return json.dumps({
+                    "found": found, "elapsed_ms": round(elapsed),
+                    "element_count": element_count,
+                    "elements": elements[:10] if found else [],
+                    "timed_out": True, "polls": polls,
+                    "message": f"Timed out waiting for element to {'appear' if mode == 'appear' else 'disappear'}",
+                })
+
+            await asyncio.sleep(poll_interval_ms / 1000.0)
+
+    except Exception as e:
+        log(f"Error in wait_for_element: {str(e)}")
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
 def find_text(
     text: str,
     title_pattern: str = None,
@@ -2737,6 +3599,88 @@ def fill_text_field(
     except Exception as e:
         log(f"Error in fill_text_field: {str(e)}")
         return f"Error in fill_text_field: {str(e)}"
+
+
+@mcp.tool()
+def fill_file_dialog(
+    file_path: str,
+    dialog_title_pattern: str = r"^(Open|Save( As)?|Browse|Select|Upload)\b",
+    action: str = "open",
+    timeout_ms: int = 5000,
+) -> str:
+    """Fill a native file Open/Save dialog with a file path and confirm.
+    Works by finding the dialog window, entering the path into the filename field, and pressing Enter.
+
+    Args:
+        file_path: Full path to enter, e.g. "C:\\Users\\me\\doc.pdf" or "/home/user/doc.pdf".
+        dialog_title_pattern: Pattern to find the dialog window. Default matches common dialog titles.
+                              Uses regex matching.
+        action: "open" — press Enter/click Open. "save" — press Enter/click Save.
+                "cancel" — press Escape to cancel the dialog. Default "open".
+        timeout_ms: Max time in ms to wait for the dialog to appear. Default 5000.
+
+    Returns:
+        Success or error message.
+    """
+    try:
+        if action not in ("open", "save", "cancel"):
+            return f"Error: action must be 'open', 'save', or 'cancel', got '{action}'"
+        if action != "cancel" and not file_path:
+            return "Error: file_path must not be empty"
+
+        # Find the file dialog window
+        start = time.monotonic()
+        window = None
+        dialog_regex = re.compile(dialog_title_pattern, re.IGNORECASE)
+        while (time.monotonic() - start) * 1000 < timeout_ms:
+            # Check active window first — most likely the dialog
+            active_window = gw.getActiveWindow()
+            if active_window and active_window.title and dialog_regex.search(active_window.title):
+                window = active_window
+                break
+            window_obj, err = _get_window_obj(dialog_title_pattern, use_regex=True, threshold=10)
+            if window_obj:
+                window = window_obj
+                break
+            time.sleep(0.3)
+
+        if not window:
+            return f"Error: No file dialog found matching '{dialog_title_pattern}' within {timeout_ms}ms"
+
+        # Activate the dialog
+        _force_activate_window(window)
+        time.sleep(0.3)
+
+        if action == "cancel":
+            pyautogui.press("escape")
+            return f"Cancelled file dialog: '{window.title}'"
+
+        # Type the file path into the filename field
+        # Most file dialogs focus the filename field by Alt+N (Windows) or the field is already focused
+        if sys.platform == "win32":
+            pyautogui.hotkey("alt", "n")  # Focus filename field in Windows file dialogs
+            time.sleep(0.2)
+        else:
+            pyautogui.hotkey("ctrl", "l")  # Common in GTK/Qt dialogs: focus location entry
+            time.sleep(0.2)
+
+        # Clear and paste the path
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.05)
+        _set_clipboard(file_path)
+        time.sleep(0.05)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.2)
+
+        # Confirm
+        pyautogui.press("enter")
+        time.sleep(0.3)
+
+        return f"Filled file dialog with path: '{file_path}' and confirmed ({action})"
+
+    except Exception as e:
+        log(f"Error in fill_file_dialog: {str(e)}")
+        return f"Error in fill_file_dialog: {str(e)}"
 
 
 # ── UI Automation Tools ─────────────────────────────────────────────────
@@ -3470,3 +4414,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
