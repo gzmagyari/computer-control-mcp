@@ -1485,6 +1485,112 @@ def get_mouse_position() -> str:
 
 
 @mcp.tool()
+def scroll(
+    direction: str = "down",
+    amount: int = 3,
+    x: int = None,
+    y: int = None,
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 10,
+    smooth: bool = False,
+) -> str:
+    """Scroll the mouse wheel at the current position or at specific coordinates.
+
+    Use this to scroll web pages, documents, lists, sidebars, dropdowns, etc.
+    If x/y are not provided, scrolls at the current mouse position (wherever
+    you last clicked or moved). Call repeatedly to keep scrolling further.
+
+    Args:
+        direction: Scroll direction — "up", "down", "left", or "right".
+        amount: Number of scroll clicks (each ~100px depending on OS/app).
+                Default 3 ≈ roughly half a page. Use 1 for fine control, 10+ for large jumps.
+        x: Optional screen X coordinate to scroll at. If omitted, uses current mouse position.
+        y: Optional screen Y coordinate to scroll at. If omitted, uses current mouse position.
+        title_pattern: Window to activate before scrolling. If provided, the window is brought
+                       to the foreground and the mouse is moved to its center (unless x/y are given).
+        use_regex: If True, treat title_pattern as regex for window matching.
+        threshold: Fuzzy match threshold (0-100) for window title.
+        smooth: If True, scroll in small increments with delays for human-like smooth scrolling.
+                Useful for apps/sites that behave differently with rapid vs gradual scroll events.
+
+    Returns:
+        Success or error message.
+    """
+    import time as _time
+    try:
+        # Activate target window if specified
+        if title_pattern:
+            all_windows = gw.getAllWindows()
+            windows = [{"title": w.title, "window_obj": w} for w in all_windows if w.title]
+            matched = _find_matching_window(windows, title_pattern, use_regex, threshold)
+            if matched:
+                _force_activate_window(matched["window_obj"])
+                # If no explicit x/y, move mouse to window center for scrolling
+                if x is None and y is None:
+                    win = matched["window_obj"]
+                    x = win.left + win.width // 2
+                    y = win.top + win.height // 2
+                    pyautogui.moveTo(x=x, y=y)
+
+        # Move to target position if specified
+        if x is not None and y is not None:
+            pyautogui.moveTo(x=x, y=y)
+
+        if direction not in ("down", "up", "left", "right"):
+            return f"Error: Invalid direction '{direction}'. Use 'up', 'down', 'left', or 'right'."
+
+        # On Windows, use mouse_event directly for reliable scrolling.
+        # pyautogui.scroll() sends tiny increments that barely move on Windows.
+        # WHEEL_DELTA = 120 per standard scroll click.
+        if sys.platform == "win32":
+            import ctypes
+            MOUSEEVENTF_WHEEL = 0x0800
+            MOUSEEVENTF_HWHEEL = 0x01000
+            WHEEL_DELTA = 120
+
+            if direction in ("down", "up"):
+                flag = MOUSEEVENTF_WHEEL
+                delta = WHEEL_DELTA * amount if direction == "up" else -WHEEL_DELTA * amount
+            else:
+                flag = MOUSEEVENTF_HWHEEL
+                delta = WHEEL_DELTA * amount if direction == "right" else -WHEEL_DELTA * amount
+
+            if smooth:
+                step_delta = WHEEL_DELTA if delta > 0 else -WHEEL_DELTA
+                for _ in range(amount):
+                    ctypes.windll.user32.mouse_event(flag, 0, 0, step_delta, 0)
+                    _time.sleep(0.05)
+            else:
+                ctypes.windll.user32.mouse_event(flag, 0, 0, delta, 0)
+        else:
+            # Linux/macOS — pyautogui works fine on these platforms
+            if direction in ("down", "up"):
+                clicks = amount if direction == "up" else -amount
+                if smooth:
+                    step = 1 if clicks > 0 else -1
+                    for _ in range(abs(clicks)):
+                        pyautogui.scroll(step)
+                        _time.sleep(0.05)
+                else:
+                    pyautogui.scroll(clicks)
+            else:
+                clicks = amount if direction == "right" else -amount
+                if smooth:
+                    step = 1 if clicks > 0 else -1
+                    for _ in range(abs(clicks)):
+                        pyautogui.hscroll(step)
+                        _time.sleep(0.05)
+                else:
+                    pyautogui.hscroll(clicks)
+
+        pos = f"({x}, {y})" if x is not None and y is not None else "current mouse position"
+        return f"Scrolled {direction} {amount} clicks at {pos}"
+    except Exception as e:
+        return f"Error scrolling: {str(e)}"
+
+
+@mcp.tool()
 def get_cursor_position() -> str:
     """Get the text cursor (caret) position on screen.
 
