@@ -3,13 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "computer-control-mcp"
-version = "0.3.10"
-description = "MCP server that provides computer control capabilities, like mouse, keyboard, OCR, etc. using PyAutoGUI, RapidOCR, ONNXRuntime. Similar to 'computer-use' by Anthropic. With Zero External Dependencies."
+name = "computer-control-mcp-enhanced"
+version = "0.4.4"
+description = "Enhanced MCP server for computer control: mouse, keyboard, screenshots, OCR, UI automation, region capture, accessibility-aware app launching. Fork of computer-control-mcp with major perception and automation improvements."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
-authors = [{name = "AB498", email = "abcd49800@gmail.com"}]
+authors = [{name = "gzmagyari"}]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -37,13 +37,13 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/AB498/computer-control-mcp"
-Issues = "https://github.com/AB498/computer-control-mcp/issues"
-Documentation = "https://github.com/AB498/computer-control-mcp#readme"
+Homepage = "https://github.com/gzmagyari/computer-control-mcp"
+Issues = "https://github.com/gzmagyari/computer-control-mcp/issues"
+Documentation = "https://github.com/gzmagyari/computer-control-mcp#readme"
 
 [project.scripts]
-computer-control-mcp = "computer_control_mcp.cli:main"
-computer-control-mcp-server = "computer_control_mcp.server:main"
+computer-control-mcp-enhanced = "computer_control_mcp.cli:main"
+computer-control-mcp-enhanced-server = "computer_control_mcp.server:main"
 
 [tool.hatch.build]
 sources = ["src"]

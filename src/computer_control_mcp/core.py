@@ -115,7 +115,7 @@ def log(message: str) -> None:
             # or append to a file: open("app.log", "a").write(message+"\n")
     except UnicodeEncodeError:
         # Handle encoding errors by escaping or replacing problematic characters
-        safe_message = message.encode('utf-8', errors='replace').decode('utf-8')
+        safe_message = message.encode('ascii', errors='replace').decode('ascii')
         if IS_DEVELOPMENT:
             print(f"[DEV] {safe_message}", file=sys.stderr)
         else:
@@ -2600,11 +2600,13 @@ def take_screenshot_with_ui_automation(
 
         # If title_pattern provided, filter to matching application/window
         if title_pattern and matched and result.get("ui_elements", {}).get("applications"):
-            matched_title = matched["title"].lower()
+            import re as _re
+            _zwsp = r'[\u200b\u200c\u200d\ufeff]'
+            matched_title = _re.sub(_zwsp, '', matched["title"].lower())
             filtered_apps = []
             total_elements = 0
             for app in result["ui_elements"]["applications"]:
-                app_name = app.get("application", "").lower()
+                app_name = _re.sub(_zwsp, '', app.get("application", "").lower())
                 # Match by app name or window title
                 if (matched_title in app_name or app_name in matched_title):
                     filtered_apps.append(app)
@@ -2613,7 +2615,8 @@ def take_screenshot_with_ui_automation(
                 # Also check window names in the stacking list
                 for win in result.get("windows", []):
                     if win["id"] in app.get("window_ids", []):
-                        if matched_title in win.get("name", "").lower() or win.get("name", "").lower() in matched_title:
+                        win_name = _re.sub(_zwsp, '', win.get("name", "").lower())
+                        if matched_title in win_name or win_name in matched_title:
                             filtered_apps.append(app)
                             total_elements += len(app.get("elements", []))
                             break

@@ -383,10 +383,10 @@ def _match_uia_window_to_stacking(uia_window, windows: List[Dict]) -> List[str]:
     # Fallback: match by title
     if not matched:
         try:
-            uia_name = (uia_window.Name or "").lower()
+            uia_name = re.sub(r'[\u200b\u200c\u200d\ufeff]', '', (uia_window.Name or "").lower())
             if uia_name:
                 for win in windows:
-                    wn = win["name"].lower()
+                    wn = re.sub(r'[\u200b\u200c\u200d\ufeff]', '', win["name"].lower())
                     if wn and (uia_name in wn or wn in uia_name):
                         matched.add(win["id"])
         except Exception:
@@ -451,7 +451,9 @@ def _get_ui_elements_win32(app_filter: Optional[str] = None) -> Dict:
                 app_name = "unknown"
 
             # Skip windows that don't match the filter (avoids expensive tree traversal)
-            if app_filter_lower and app_filter_lower not in app_name.lower():
+            # Strip zero-width characters for comparison (Edge uses \u200b in title)
+            app_name_clean = re.sub(r'[\u200b\u200c\u200d\ufeff]', '', app_name.lower())
+            if app_filter_lower and app_filter_lower not in app_name_clean:
                 continue
 
             elements = _collect_uia_elements(uia_window)
