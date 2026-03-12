@@ -820,11 +820,21 @@ def _find_matching_window(
 
 
 @mcp.tool()
-def click_screen(x: int, y: int) -> str:
-    """Click at the specified screen coordinates."""
+def click_screen(x: int, y: int, button: str = "left", num_clicks: int = 1) -> str:
+    """Click at the specified screen coordinates.
+
+    Args:
+        x: Screen X coordinate.
+        y: Screen Y coordinate.
+        button: Mouse button — "left", "right", or "middle". Default: "left".
+        num_clicks: Number of clicks (e.g. 2 for double-click). Default: 1.
+    """
     try:
-        pyautogui.click(x=x, y=y)
-        return f"Successfully clicked at coordinates ({x}, {y})"
+        if button not in ("left", "right", "middle"):
+            return f"Error: button must be 'left', 'right', or 'middle', got '{button}'"
+        pyautogui.click(x=x, y=y, button=button, clicks=num_clicks)
+        click_desc = f"{'double-' if num_clicks == 2 else ''}{button}-clicked" if num_clicks != 1 or button != "left" else "clicked"
+        return f"Successfully {click_desc} at coordinates ({x}, {y})"
     except Exception as e:
         return f"Error clicking at coordinates ({x}, {y}): {str(e)}"
 
