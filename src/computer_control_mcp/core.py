@@ -37,6 +37,7 @@ from fuzzywuzzy import fuzz, process
 
 import cv2
 import numpy as np
+from .accessibility_launcher import launch_app as _a11y_launch_app
 from rapidocr import RapidOCR, LangRec, ModelType, OCRVersion
 
 from pydantic import BaseModel
@@ -1630,6 +1631,68 @@ def capture_region_around(
         stack_trace = traceback.format_exc()
         log(f"Stack trace:\n{stack_trace}")
         return f"Error capturing region around ({x}, {y}): {str(e)}"
+
+
+@mcp.tool()
+def launch_app(
+    command: list,
+    family: str = "auto",
+    cwd: str = None,
+    accessibility: bool = True,
+    persist_gnome_a11y: bool = False,
+    dry_run: bool = False,
+) -> str:
+    """Launch an application with accessibility settings enabled for better UI automation.
+
+    Automatically detects the app type and applies the right accessibility flags:
+    - Chromium/Electron: adds --force-renderer-accessibility
+    - VS Code family: sets ACCESSIBILITY_ENABLED=1 (Linux)
+    - Qt/KDE apps: sets QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 (Linux)
+    - GTK/GNOME: activates session-level AT-SPI (Linux)
+
+    This makes apps expose more UI elements to UI automation tools.
+
+    Args:
+        command: Command as list of strings, e.g. ["code", "."] or ["google-chrome", "https://example.com"]
+        family: App family override - "auto" (detect), "chromium", "electron", "vscode", "qt", "gtk", "jetbrains", "none"
+        cwd: Working directory for the launched process
+        accessibility: Apply accessibility flags (default True)
+        persist_gnome_a11y: On Linux, also write persistent GNOME accessibility gsettings
+        dry_run: Preview the launch plan without actually launching
+    """
+    try:
+        result = _a11y_launch_app(
+            command,
+            accessibility=accessibility,
+            family=family,
+            cwd=cwd,
+            persist_gnome_a11y=persist_gnome_a11y,
+            dry_run=dry_run,
+        )
+
+        lines = [
+            f"Platform: {result.platform}",
+            f"Family: {result.family}",
+        ]
+        if result.matched_app:
+            lines.append(f"Matched app: {result.matched_app}")
+        lines.append(f"Effective command: {' '.join(result.effective_command)}")
+        if result.launched:
+            lines.append(f"Launched: PID {result.pid}")
+        elif result.dry_run:
+            lines.append("Dry run: not launched")
+        if result.env_overrides:
+            lines.append("Env overrides: " + ", ".join(f"{k}={v}" for k, v in result.env_overrides.items()))
+        if result.session_actions:
+            lines.append("Session actions: " + "; ".join(result.session_actions))
+        if result.notes:
+            lines.append("Notes: " + "; ".join(result.notes))
+        if result.warnings:
+            lines.append("Warnings: " + "; ".join(result.warnings))
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error launching app: {str(e)}"
 
 
 @mcp.tool()
