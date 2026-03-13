@@ -6,7 +6,7 @@ Best practices for AI agents using the Computer Control MCP to see, understand, 
 
 ## Core Concepts
 
-### Three-Layer Perception Model
+### Four-Layer Perception Model
 
 No single source captures everything on screen. Use the right combination:
 
@@ -14,7 +14,12 @@ No single source captures everything on screen. Use the right combination:
 |-------|-----------------|----------------|-------------|
 | **Screenshot** (image) | Everything visual — layout, colors, icons, graphics | No coordinates, no semantic info | Always — your primary "eyes" |
 | **UI Automation** (accessibility tree) | Widgets: buttons, menus, entries, tabs — with names, roles, actions, bounding boxes | Custom-drawn content, canvas, images | When you need to find clickable elements |
+| **Deep UI Automation** (element refs + semantic actions) | Full element tree with stable refs, text values, supported patterns/actions, tree traversal | Same as UI Automation — limited for custom-drawn content | When you need to interact semantically (toggle, select, set values) or navigate the UI tree |
 | **OCR** (text detection) | Any visible text rendered on screen | Non-text graphics, icons without labels | When reading text from images/canvas that UI automation can't see |
+
+**Choosing between UI Automation and Deep UI Automation:**
+- **UI Automation** (`take_screenshot_with_ui_automation`) — lightweight, returns elements with screenshot, good for finding coordinates to click
+- **Deep UI Automation** (`find_ui_elements`, semantic actions) — heavier, returns element refs with full metadata, supports direct interaction (toggle, set text, select) without coordinates. Use when you need to *do something* with the element, not just click it
 
 ### Coordinate System
 
@@ -78,13 +83,15 @@ take_screenshot_full(image_format="webp", quality=30, include_ocr=false, include
 
 | Action | Verify with |
 |--------|------------|
-| Launch an app | `wait_for_element` or screenshot |
-| Open a dialog (Ctrl+O, Ctrl+S, etc.) | Screenshot — is the dialog visible? |
+| Launch an app | `wait_for_window` (cheapest) or screenshot |
+| Open a dialog (Ctrl+O, Ctrl+S, etc.) | `wait_for_window` for known title, or screenshot |
 | Switch windows | Screenshot — is the right window in foreground? |
 | Submit a form / press Enter | Screenshot — did the expected result happen? |
-| Close a dialog / window | Screenshot — is it gone? |
+| Close a dialog / window | `wait_for_window(mode="disappear")` or screenshot |
 | Navigate to a URL | Screenshot or `wait_for_text` — did the page load? |
 | Click a button | Screenshot — did the UI change as expected? |
+| Toggle a switch / checkbox | `get_element_details` to check toggle state, or screenshot |
+| Set a text field | `get_element_text` to read back the value |
 
 ### Cost of verification vs cost of failure
 
@@ -99,6 +106,16 @@ A Tier 1 confirmation screenshot costs **~67 KB**. A failed blind action chain c
 | See what's on screen | `take_screenshot_full` | `image_format="webp", quality=50` |
 | Find a button/field to click | `take_screenshot_with_ui_automation` | `interactable_only=true` |
 | Find specific UI elements | `take_screenshot_with_ui_automation` | `name_filter`, `role_filter` |
+| **Deep-search UI elements** | `find_ui_elements` | `text_filter`, `role_filter`, `name_filter` with paging |
+| **Get focused element details** | `get_focused_element` | `title_pattern` to scope to a window |
+| **Inspect element at coordinates** | `get_element_at_point` | `x, y` — returns the deepest element |
+| **Get element full details** | `get_element_details` | `element_ref` from any discovery tool |
+| **Navigate element tree** | `get_element_children` / `get_element_parent` | `element_ref` — walk the UI tree |
+| **Perform semantic action** | `invoke_element`, `toggle_element`, `select_element`, etc. | `element_ref` — no coordinates needed |
+| **Set text via automation** | `set_element_text` | `element_ref`, `text` — uses ValuePattern |
+| **Read text via automation** | `get_element_text` | `element_ref` — reads from ValuePattern/TextPattern |
+| **Set slider/range value** | `set_element_range_value` | `element_ref`, `value` |
+| **Move/resize window via UIA** | `move_element_ui`, `resize_element_ui`, `set_element_extents` | `element_ref` of a window frame |
 | Read text on screen | `take_screenshot_with_ocr` | `ocr_text_filter` for targeted search |
 | Find specific text (like grep) | `take_screenshot_with_ocr` | `ocr_text_filter="mem4\|mem 4"` |
 | Find text to click | `find_text` | `text="Submit\|OK"` with pipe-separated OR |
@@ -110,6 +127,13 @@ A Tier 1 confirmation screenshot costs **~67 KB**. A failed blind action chain c
 | Bring a window to front | `activate_window` | `title_pattern` |
 | Open an app (known command) | `launch_app` | `command=["google-chrome"]` — enables accessibility |
 | Open an app (desktop icon) | OCR + double-click | `ocr_text_filter="VLC"` → `click_screen(num_clicks=2)` |
+| **Wait for a window** | `wait_for_window` | `title_pattern`, `mode="appear\|disappear\|active"` |
+| **Wait for focused element** | `wait_for_focused_element` | `name_filter`, `role_filter` with timeout |
+| **Watch filesystem changes** | `start_file_watch` → `get_file_watch_events` | Persistent watcher with event queue |
+| **Wait for a file change** | `wait_for_file_change` | One-shot wait with timeout |
+| **Kill a process** | `kill_process` | `process_name` or `pid`, `force=true` for stubborn apps |
+| **List running processes** | `list_processes` | Returns process names and PIDs |
+| **Get system info** | `get_system_info` | CPU, memory, disk, OS details |
 | Verify before clicking | `capture_region_around` | Small region around target coords |
 | Check if something changed | `check_screen_changed_full` | After performing an action |
 
@@ -363,6 +387,372 @@ find_text(text="Submit|OK|Save")
 
 ---
 
+## Deep UI Automation
+
+Deep UI automation gives you **semantic access** to application elements — you can discover, inspect, and interact with UI elements by their role, name, and actions rather than just clicking coordinates. This is more reliable than coordinate-based interaction because element refs survive minor layout shifts.
+
+### When to Use Deep UI vs Screenshot-Based Approach
+
+| Scenario | Use | Why |
+|----------|-----|-----|
+| Toggle a switch, check a checkbox | Deep UI (`toggle_element`) | Semantic action — no coordinates needed |
+| Fill a text field | Deep UI (`set_element_text`) | Direct value injection, no click+type needed |
+| Select a list item or tab | Deep UI (`select_element`) | Works even if element is partially hidden |
+| Read a field's current value | Deep UI (`get_element_text`) | Exact value, not OCR approximation |
+| Click a web page link | Screenshot + coordinate | Web content often not in deep UI tree |
+| Interact with canvas/games | Screenshot + coordinate | Custom-drawn content has no UI elements |
+| Verify visual appearance | Screenshot | Deep UI has no visual information |
+
+### Element Refs (Stable Handles)
+
+Every deep UI tool returns and accepts **element refs** — JSON objects that identify a specific UI element. Refs contain the element's path in the UI tree, window ID, and metadata for re-resolution.
+
+```json
+{
+  "backend": "uia",
+  "app": "Settings",
+  "window_ids": ["0x3fc001a"],
+  "path": [1, 1, 3, 0, 3, 0, 1],
+  "role": "push button",
+  "name": "Schedule night light",
+  "bounds": {"x": 1095, "y": 363, "w": 72, "h": 40}
+}
+```
+
+**Key properties of refs:**
+- Refs are re-resolved each time you use them — the path is walked from the window root
+- They survive minor UI changes (scrolling, focus changes) as long as the tree structure hasn't changed
+- They break when the **window title changes** (e.g., Notepad title changes after editing: `"Untitled - Notepad"` → `"*Hello - Notepad"`) — re-discover with `find_ui_elements`
+- They break when the **element tree restructures** (e.g., new items added above the target)
+- Pass them directly to any action tool: `toggle_element(element_ref={...})`
+
+### Discovery Tools
+
+| Tool | Purpose | Best for |
+|------|---------|----------|
+| `find_ui_elements` | Search for elements by name, role, or text content | Finding specific controls across a window |
+| `get_focused_element` | Get the currently focused element | Checking what has keyboard focus |
+| `get_element_at_point` | Get the deepest element at screen coordinates | Identifying what's under the cursor |
+
+#### `find_ui_elements` — Your Primary Discovery Tool
+
+```
+find_ui_elements(
+    title_pattern="Settings",           # Window to search in (fuzzy match)
+    text_filter="Night light|Bluetooth", # Search text/name/value (pipe-separated OR)
+    role_filter="push button|slider",    # Filter by role (pipe-separated OR)
+    interactable_only=true,              # Only elements with actions
+    offset=0, limit=20                   # Paging — essential for large results
+)
+```
+
+**Important parameters:**
+- `text_filter` — Searches across element name, text, and value fields. Pipe-separated OR terms.
+- `role_filter` — Filters by accessibility role. Use the role names from the Common Roles table below.
+- `name_filter` — Filters by element name only (stricter than `text_filter`).
+- `offset` / `limit` — Pagination. Default limit is 100. Use `limit=20` for focused searches.
+- `max_depth` — Tree traversal depth (default 40). Lower for faster but shallower searches.
+- `interactable_only` — Only returns elements that support actions (invoke, toggle, select, etc.).
+
+**Response includes:** `total_count`, `offset`, `limit`, `has_more` for paging through large result sets.
+
+#### `get_element_at_point` — Identify by Coordinates
+
+```
+get_element_at_point(x=500, y=300)
+# Returns the deepest element at that screen position
+```
+
+Useful when you can see something in a screenshot but don't know its name/role.
+
+### Tree Traversal
+
+Navigate the element hierarchy to understand structure or find related elements:
+
+```
+# Get children of a container
+get_element_children(element_ref={...})
+
+# Get parent of an element
+get_element_parent(element_ref={...})
+
+# Get full details (patterns, states, properties)
+get_element_details(element_ref={...})
+```
+
+**When to traverse:**
+- You found a container (group, pane, tab) and need its child controls
+- You found an element and need context about its parent (which dialog/group it belongs to)
+- You need to check what patterns (actions) an element supports before trying to interact
+
+### Semantic Actions
+
+These actions operate on element refs — no coordinate math needed.
+
+| Action Tool | What it does | Requires pattern |
+|------------|-------------|-----------------|
+| `focus_element` | Give keyboard focus to element | SetFocus |
+| `invoke_element` | Click/activate (buttons, menu items, links) | InvokePattern |
+| `toggle_element` | Toggle on/off (checkboxes, switches) | TogglePattern |
+| `select_element` | Select (list items, tabs, radio buttons) | SelectionItemPattern |
+| `expand_element` | Expand (tree nodes, combo boxes, menus) | ExpandCollapsePattern |
+| `collapse_element` | Collapse (tree nodes, combo boxes) | ExpandCollapsePattern |
+| `set_element_text` | Set text value (input fields) | ValuePattern |
+| `get_element_text` | Read text value | ValuePattern / TextPattern |
+| `scroll_element_into_view` | Scroll element into visible area | ScrollItemPattern |
+| `set_element_range_value` | Set numeric value (sliders, progress bars) | RangeValuePattern |
+| `move_element_ui` | Move element to position (windows) | TransformPattern |
+| `resize_element_ui` | Resize element (windows) | TransformPattern |
+| `set_element_extents` | Move + resize in one call (windows) | TransformPattern |
+
+**Pattern support varies by app.** If an element doesn't support the required pattern, the action will fail with an error. Use `get_element_details` to check what patterns an element supports before attempting less-common actions.
+
+### Deep UI Common Roles
+
+| Role | What it is | Common actions |
+|------|-----------|---------------|
+| `push button` | Clickable button | invoke |
+| `document` / `edit` | Text input area | set_text, get_text, focus |
+| `combo box` | Dropdown / select | expand, collapse |
+| `list item` | Item in a list | select, invoke |
+| `page tab` / `tab item` | Tab in a tab bar | select |
+| `menu item` | Menu entry | invoke |
+| `check box` | Checkbox | toggle |
+| `toggle switch` | On/off switch (Win11 Settings) | toggle |
+| `slider` | Range slider | set_range_value |
+| `tree item` | Tree node | expand, collapse, select |
+| `frame` / `window` | Top-level window | move, resize, set_extents |
+| `link` | Hyperlink | invoke |
+
+### Deep UI Workflow Example — Toggle a Setting
+
+```
+# 1. Find the toggle switch
+find_ui_elements(
+    title_pattern="Settings",
+    text_filter="Night light",
+    role_filter="push button",    # Toggle switches appear as "push button" in UIA
+    interactable_only=true
+)
+# → Returns element with ref and localized_control_type="toggle switch"
+
+# 2. Toggle it
+toggle_element(element_ref={...ref from step 1...})
+# → "Toggled element"
+
+# 3. Verify with screenshot
+take_screenshot_full(title_pattern="Settings", image_format="webp", quality=30,
+                     include_ocr=false, include_ui=false)
+```
+
+### Deep UI Workflow Example — Fill a Form Field
+
+```
+# 1. Find the text field
+find_ui_elements(
+    title_pattern="Notepad",
+    role_filter="document|edit",
+    limit=5
+)
+
+# 2. Set text directly (no click needed)
+set_element_text(element_ref={...ref...}, text="Hello World")
+
+# 3. Read back to verify
+get_element_text(element_ref={...ref...})
+# → "Hello World"
+```
+
+### Deep UI Workflow Example — Move/Resize a Window
+
+```
+# 1. Find the window frame element
+find_ui_elements(
+    title_pattern="Notepad",
+    max_depth=0          # Only top-level — the window itself
+)
+# → Returns frame element with role="frame"
+
+# 2. Move it
+move_element_ui(element_ref={...frame ref...}, x=100, y=100)
+
+# 3. Resize it
+resize_element_ui(element_ref={...frame ref...}, width=800, height=600)
+
+# 4. Or do both at once
+set_element_extents(element_ref={...frame ref...}, x=200, y=200, width=900, height=700)
+```
+
+---
+
+## Wait & Polling Tools
+
+Use these to synchronize with application state changes instead of blind delays.
+
+### `wait_for_window` — Wait for Window State
+
+```
+# Wait for an app to open
+wait_for_window(title_pattern="Notepad", mode="appear", timeout_ms=10000)
+
+# Wait for a dialog to close
+wait_for_window(title_pattern="Save As", mode="disappear", timeout_ms=5000)
+
+# Wait for a window to become active (foreground)
+wait_for_window(title_pattern="Chrome", mode="active", timeout_ms=5000)
+```
+
+**Modes:** `appear` (default), `disappear`, `active`
+
+**Returns:** `found`, `active`, `elapsed_ms`, `timed_out`, and `title` of matched window.
+
+### `wait_for_focused_element` — Wait for Focus Target
+
+```
+# Wait until a specific type of element gets focus
+wait_for_focused_element(
+    title_pattern="Notepad",
+    role_filter="document",
+    timeout_ms=5000
+)
+```
+
+Polls until the focused element matches your name/role filters. Useful after programmatically focusing an element or opening a dialog.
+
+### When to Use Wait Tools vs Screenshots
+
+| Scenario | Use |
+|----------|-----|
+| Launched an app, need to know when it's ready | `wait_for_window` — cheap, precise, returns immediately when found |
+| Clicked a button, need to verify dialog opened | `wait_for_window` for known dialog title |
+| Need to see what happened after an action | Screenshot — visual verification |
+| Waiting for an element to gain focus | `wait_for_focused_element` |
+| Need to verify complex visual state | Screenshot — wait tools can't check visual layout |
+
+---
+
+## File System Watching
+
+Monitor filesystem changes — useful for watching build output, log files, downloads, or any directory where files change.
+
+### Persistent Watch (long-running)
+
+```
+# 1. Start watching a directory
+start_file_watch(paths="C:/Users/me/Downloads", recursive=true)
+# → {"watch_id": "abc-123", ...}
+
+# 2. Do other things... files get created/modified/deleted
+
+# 3. Check what changed
+get_file_watch_events(watch_id="abc-123")
+# → {"events": [{"event_type": "created", "src_path": "...", "timestamp": "..."}]}
+
+# 4. Stop when done
+stop_file_watch(watch_id="abc-123")
+```
+
+**`start_file_watch` parameters:**
+- `paths` — Single path string or list of paths to watch
+- `recursive` — Watch subdirectories (default `true`)
+- `event_types` — Filter: `"created"`, `"modified"`, `"deleted"`, `"moved"` (default: all)
+- `max_events` — Queue size limit (default 500, oldest dropped when full)
+
+**`get_file_watch_events` parameters:**
+- `watch_id` — From `start_file_watch` response
+- `clear` — Clear events after reading (default `true`)
+- `max_events` — Max events to return (default 100)
+
+### One-Shot Wait (block until change)
+
+```
+# Wait for any change in a directory (blocks until change or timeout)
+wait_for_file_change(
+    paths="C:/Users/me/project/dist",
+    timeout_ms=30000
+)
+# → {"changed": true, "events": [{"event_type": "modified", ...}]}
+```
+
+Useful for waiting on build output, file downloads, or log updates.
+
+### File Watch Workflow — Monitor a Build
+
+```
+# 1. Start watching the output directory
+start_file_watch(paths="C:/project/dist")
+
+# 2. Trigger the build (via terminal, button click, etc.)
+type_text("npm run build")
+press_keys("enter")
+
+# 3. Wait for output
+wait_for_file_change(paths="C:/project/dist", timeout_ms=60000)
+# → Build output files detected
+
+# 4. Or poll periodically
+get_file_watch_events(watch_id="...")
+# → Check what files were created/modified
+```
+
+### File Watch Workflow — Watch for Downloads
+
+```
+# 1. Start watching Downloads folder
+start_file_watch(paths="C:/Users/me/Downloads", event_types="created")
+
+# 2. Click download button in browser
+click_screen(x=500, y=300)
+
+# 3. Wait for file to appear
+wait_for_file_change(paths="C:/Users/me/Downloads", timeout_ms=30000)
+# → {"events": [{"event_type": "created", "src_path": "...\\report.pdf"}]}
+```
+
+**Note:** Requires the `watchdog` Python library. If not installed, these tools return `{"error": "watchdog is not installed"}`.
+
+---
+
+## Process & System Management
+
+### `kill_process` — Terminate a Process
+
+```
+# Kill by name (all matching processes)
+kill_process(process_name="Notepad.exe")
+
+# Kill specific PID
+kill_process(pid=12345)
+
+# Force kill (SIGKILL / taskkill /F) for stubborn processes
+kill_process(process_name="chrome.exe", force=true)
+```
+
+**Tips:**
+- Graceful kill (`force=false`) may not work for some apps (e.g., Windows Notepad ignores it). Use `force=true` if graceful fails.
+- Killing by `process_name` kills **all** matching processes. Use `pid` for precision.
+- The PID returned by `launch_app` may differ from the actual app PID (parent process exits, child continues). Use `list_processes` to find the real PID.
+
+### `list_processes` — List Running Processes
+
+```
+list_processes()
+# → {"processes": [{"name": "chrome.exe", "pid": 1234, "session": "Console", "mem_usage": "150,432 K"}, ...]}
+```
+
+Returns all running processes with PID and memory usage. Useful for finding a process before killing it or checking if an app is running.
+
+### `get_system_info` — System Diagnostics
+
+```
+get_system_info()
+# → {"cpu": {...}, "memory": {...}, "disk": [...], "os": {...}, "network": {...}}
+```
+
+Returns CPU, memory, disk, OS, and network information. Useful for diagnostics, checking available resources, or understanding the environment.
+
+---
+
 ## Common Workflows
 
 ### Navigate a Browser to a URL
@@ -486,8 +876,8 @@ launch_app(command=["google-chrome"], dry_run=true)
 **Verification after launch:**
 ```
 launch_app(command=["notepad"])
-wait_for_element(name_filter="Notepad", role_filter="window", timeout_ms=5000)
-# OR
+wait_for_window(title_pattern="Notepad", timeout_ms=5000)
+# OR for visual confirmation:
 take_screenshot_full(image_format="webp", quality=30, include_ocr=false, include_ui=false)
 ```
 
@@ -627,6 +1017,11 @@ the universal fallback for any coordinate-based interaction.
 - Use `ocr_text_filter` to search OCR results server-side — 97% smaller responses than unfiltered OCR.
 - Use `webp` format with `quality=50` — 5x smaller than default PNG with no visible loss.
 - For repeated screenshots of the same window, the window matching is cached — subsequent calls are faster.
+- **Prefer `wait_for_window` over screenshot** when checking if an app launched — it's a lightweight poll with no image transfer.
+- **Use `find_ui_elements` with `limit=20`** for focused searches — avoid returning 100+ elements when you only need a few.
+- **Use semantic actions over coordinate clicking** when possible — `toggle_element`, `invoke_element`, `select_element` are more reliable than calculating coordinates and clicking.
+- **Reuse element refs** within the same interaction sequence — no need to re-discover elements that haven't changed.
+- **Use persistent file watchers** (`start_file_watch`) over one-shot waits when you need to catch events that may happen at unpredictable times.
 
 ---
 
@@ -643,3 +1038,9 @@ the universal fallback for any coordinate-based interaction.
 | OCR output too large / truncated | Full-screen OCR returns 60K+ chars | Use `ocr_text_filter="search term"` to filter server-side |
 | OCR filter returns no results | Threshold too high or OCR misread the text | Lower `ocr_match_threshold` to 40, try alternate spellings with `\|` |
 | Can't find desktop icon via UIA | Desktop icons use shell ListView, poorly exposed | Use `take_screenshot_with_ocr(ocr_text_filter="icon name")` + `click_screen(num_clicks=2)` |
+| Element ref fails to resolve | Window title changed (e.g., after editing a file) | Re-discover with `find_ui_elements` using updated `title_pattern` |
+| `toggle_element` / `select_element` fails | Element doesn't support the required UIA pattern | Use `get_element_details` to check supported patterns; fall back to `click_screen` |
+| `find_ui_elements` returns too many results | No filters applied | Use `text_filter`, `role_filter`, `interactable_only=true`, and `limit=20` |
+| `launch_app` PID doesn't match `list_processes` | Parent process exited, child has different PID | Use `list_processes` to find actual PID, or `kill_process(process_name=...)` |
+| File watch returns "watchdog not installed" | `watchdog` library missing from Python environment | Install: `pip install watchdog` and restart MCP server |
+| `wait_for_file_change` times out | Change happened before watcher initialized, or path wrong | Use persistent `start_file_watch` instead; verify path exists with correct format |

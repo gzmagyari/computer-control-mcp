@@ -12,6 +12,7 @@ import sys
 import os
 import time
 import subprocess
+from collections import deque
 from typing import Dict, Any, List, Optional, Tuple
 from io import BytesIO
 import re
@@ -42,7 +43,16 @@ from .accessibility_launcher import launch_app as _a11y_launch_app
 from rapidocr import RapidOCR, LangRec, ModelType, OCRVersion
 
 from pydantic import BaseModel
-from computer_control_mcp.ui_automation import get_ui_elements
+from computer_control_mcp.ui_automation import (
+    get_ui_elements,
+    find_ui_elements_deep,
+    get_focused_ui_element_deep,
+    get_ui_element_at_point_deep,
+    get_ui_element_details as _get_ui_element_details_deep,
+    get_ui_element_children as _get_ui_element_children_deep,
+    get_ui_element_parent as _get_ui_element_parent_deep,
+    perform_ui_action as _perform_ui_action_deep,
+)
 
 BaseModel.model_config = {"arbitrary_types_allowed": True}
 
@@ -60,6 +70,8 @@ engine = RapidOCR(
 _last_screenshots: Dict[str, Any] = {}
 _last_ocr_results: Dict[str, Any] = {}
 _last_ui_elements: Dict[str, Any] = {}
+_file_watchers: Dict[str, Any] = {}
+_file_watch_lock = threading.Lock()
 
 # Region-splitting OCR configuration (all configurable)
 OCR_REGION_GRID = (4, 3)          # (cols, rows) — total regions = cols * rows
@@ -94,6 +106,13 @@ try:
     WGC_AVAILABLE = True
 except ImportError:
     WGC_AVAILABLE = False
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    WATCHDOG_AVAILABLE = False
 
 
 # Determine mode automatically
@@ -832,6 +851,80 @@ def _get_window_obj(title_pattern: str, use_regex: bool = False, threshold: int 
     if not matched:
         return None, f"Error: No window found matching pattern: {title_pattern}"
     return matched["window_obj"], None
+
+
+def _resolve_window_title_pattern(
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 60,
+) -> Optional[str]:
+    """Resolve a fuzzy/regex title pattern to an exact current window title."""
+    if not title_pattern:
+        return None
+    all_windows = gw.getAllWindows()
+    windows = [{"title": w.title, "window_obj": w} for w in all_windows if w.title]
+    matched = _find_matching_window(windows, title_pattern, use_regex, threshold)
+    return matched["title"] if matched else title_pattern
+
+
+def _matches_pipe_filter(value: str, filter_value: str) -> bool:
+    if not filter_value:
+        return True
+    value_lower = (value or "").lower()
+    for term in filter_value.split("|"):
+        term = term.strip().lower()
+        if term and term in value_lower:
+            return True
+    return False
+
+
+class _QueuedFileWatchHandler(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
+    def __init__(self, queue: deque, allowed_types: Optional[set] = None):
+        super().__init__()
+        self.queue = queue
+        self.allowed_types = allowed_types
+
+    def _push(self, event_type: str, event):
+        if self.allowed_types and event_type not in self.allowed_types:
+            return
+        payload = {
+            "event_type": event_type,
+            "src_path": getattr(event, "src_path", None),
+            "dest_path": getattr(event, "dest_path", None),
+            "is_directory": bool(getattr(event, "is_directory", False)),
+            "timestamp": datetime.datetime.now().isoformat(),
+        }
+        self.queue.append(payload)
+
+    def on_created(self, event):
+        self._push("created", event)
+
+    def on_modified(self, event):
+        self._push("modified", event)
+
+    def on_deleted(self, event):
+        self._push("deleted", event)
+
+    def on_moved(self, event):
+        self._push("moved", event)
+
+    def on_closed(self, event):
+        self._push("closed", event)
+
+
+def _normalize_watch_paths(paths: Union[str, List[str]]) -> List[str]:
+    if isinstance(paths, str):
+        paths = [paths]
+    return [str(p) for p in (paths or []) if str(p).strip()]
+
+
+def _normalize_watch_event_types(event_types: Optional[Union[str, List[str]]]) -> Optional[set]:
+    if not event_types:
+        return None
+    if isinstance(event_types, str):
+        event_types = event_types.split("|")
+    out = {str(t).strip().lower() for t in event_types if str(t).strip()}
+    return out or None
 
 
 def _find_matching_window(
@@ -2749,6 +2842,164 @@ def get_system_info() -> str:
 
 
 @mcp.tool()
+def start_file_watch(
+    paths: Union[str, List[str]],
+    recursive: bool = True,
+    event_types: Union[str, List[str]] = None,
+    max_events: int = 500,
+) -> str:
+    """Start a persistent filesystem watch and return a watch_id."""
+    try:
+        if not WATCHDOG_AVAILABLE:
+            return json.dumps({"error": "watchdog is not installed"})
+
+        normalized_paths = _normalize_watch_paths(paths)
+        if not normalized_paths:
+            return json.dumps({"error": "No valid paths provided"})
+
+        allowed_types = _normalize_watch_event_types(event_types)
+        queue = deque(maxlen=max(10, max_events))
+        observer = Observer()
+        handler = _QueuedFileWatchHandler(queue=queue, allowed_types=allowed_types)
+
+        scheduled = []
+        for path in normalized_paths:
+            if not os.path.exists(path):
+                continue
+            observer.schedule(handler, path, recursive=recursive)
+            scheduled.append(path)
+
+        if not scheduled:
+            return json.dumps({"error": "None of the provided paths exist"})
+
+        observer.start()
+        watch_id = str(uuid.uuid4())
+        with _file_watch_lock:
+            _file_watchers[watch_id] = {
+                "observer": observer,
+                "queue": queue,
+                "paths": scheduled,
+                "recursive": recursive,
+                "event_types": sorted(list(allowed_types)) if allowed_types else None,
+                "created_at": datetime.datetime.now().isoformat(),
+            }
+
+        return json.dumps({
+            "started": True,
+            "watch_id": watch_id,
+            "paths": scheduled,
+            "recursive": recursive,
+            "event_types": sorted(list(allowed_types)) if allowed_types else None,
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_file_watch_events(
+    watch_id: str,
+    clear: bool = True,
+    max_events: int = 100,
+) -> str:
+    """Read queued events from a persistent file watch."""
+    try:
+        with _file_watch_lock:
+            watch = _file_watchers.get(watch_id)
+        if not watch:
+            return json.dumps({"error": f"Unknown watch_id: {watch_id}"})
+
+        queue = watch["queue"]
+        events = []
+        if clear:
+            while queue and len(events) < max_events:
+                events.append(queue.popleft())
+        else:
+            events = list(queue)[:max_events]
+
+        return json.dumps({
+            "watch_id": watch_id,
+            "event_count": len(events),
+            "events": events,
+            "remaining": len(queue),
+        }, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def stop_file_watch(watch_id: str) -> str:
+    """Stop a persistent filesystem watch."""
+    try:
+        with _file_watch_lock:
+            watch = _file_watchers.pop(watch_id, None)
+        if not watch:
+            return json.dumps({"stopped": False, "error": f"Unknown watch_id: {watch_id}"})
+
+        observer = watch["observer"]
+        observer.stop()
+        observer.join(timeout=5)
+        return json.dumps({"stopped": True, "watch_id": watch_id})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def wait_for_file_change(
+    paths: Union[str, List[str]],
+    recursive: bool = True,
+    event_types: Union[str, List[str]] = None,
+    timeout_ms: int = 10000,
+) -> str:
+    """Wait once for the next filesystem change on one or more paths."""
+    try:
+        if not WATCHDOG_AVAILABLE:
+            return json.dumps({"error": "watchdog is not installed"})
+
+        normalized_paths = _normalize_watch_paths(paths)
+        if not normalized_paths:
+            return json.dumps({"error": "No valid paths provided"})
+
+        allowed_types = _normalize_watch_event_types(event_types)
+        queue = deque(maxlen=100)
+        event_flag = threading.Event()
+
+        class _OneShotHandler(_QueuedFileWatchHandler):
+            def _push(self, event_type: str, event):
+                super()._push(event_type, event)
+                event_flag.set()
+
+        observer = Observer()
+        handler = _OneShotHandler(queue=queue, allowed_types=allowed_types)
+
+        scheduled = []
+        for path in normalized_paths:
+            if not os.path.exists(path):
+                continue
+            observer.schedule(handler, path, recursive=recursive)
+            scheduled.append(path)
+
+        if not scheduled:
+            return json.dumps({"error": "None of the provided paths exist"})
+
+        observer.start()
+        try:
+            changed = await asyncio.to_thread(event_flag.wait, timeout_ms / 1000.0)
+            events = list(queue)
+            return json.dumps({
+                "changed": bool(changed),
+                "timed_out": not bool(changed),
+                "paths": scheduled,
+                "event_count": len(events),
+                "events": events,
+            }, default=str)
+        finally:
+            observer.stop()
+            observer.join(timeout=5)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
 def wait_milliseconds(milliseconds: int) -> str:
     """
     Wait for a specified number of milliseconds.
@@ -4118,6 +4369,412 @@ def take_screenshot_with_ui_automation(
     except Exception as e:
         log(f"Error in take_screenshot_with_ui_automation: {str(e)}")
         return json.dumps({"error": str(e), "available": False})
+
+
+@mcp.tool()
+def find_ui_elements(
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 60,
+    region: list = None,
+    name_filter: str = None,
+    role_filter: str = None,
+    text_filter: str = None,
+    interactable_only: bool = False,
+    include_hidden: bool = False,
+    max_depth: int = 40,
+    offset: int = 0,
+    limit: int = 100,
+) -> str:
+    """Find deep UI automation elements with stable-ish refs and semantic metadata.
+
+    Args:
+        title_pattern: Window title to search in (fuzzy match)
+        use_regex: Treat title_pattern as regex
+        threshold: Fuzzy match threshold (0-100)
+        region: [x, y, w, h] to restrict search area
+        name_filter: Filter by element name, pipe-separated OR: "Save|Cancel|OK"
+        role_filter: Filter by role, pipe-separated OR: "push button|entry|link"
+        text_filter: Search element text/name/value content, pipe-separated OR: "README|Setup"
+        interactable_only: Only return elements with actions
+        include_hidden: Include elements behind other windows
+        max_depth: Max tree traversal depth (default 40)
+        offset: Skip first N elements (for paging). Default 0.
+        limit: Max elements to return (for paging). Default 100. Use 0 for unlimited.
+
+    Returns:
+        JSON with elements array, total_count, offset, limit, and has_more flag.
+    """
+    try:
+        app_filter = _resolve_window_title_pattern(title_pattern, use_regex, threshold)
+        result = find_ui_elements_deep(
+            app_filter=app_filter,
+            region=region,
+            name_filter=name_filter,
+            role_filter=role_filter,
+            interactable_only=interactable_only,
+            include_hidden=include_hidden,
+            max_depth=max_depth,
+        )
+
+        elements = result.get("elements", [])
+
+        # Text content filter (searches name, text, and value fields)
+        if text_filter:
+            terms = [t.strip().lower() for t in text_filter.split("|") if t.strip()]
+            if terms:
+                filtered = []
+                for el in elements:
+                    searchable = " ".join([
+                        el.get("name", ""),
+                        el.get("text", ""),
+                        str(el.get("value", "")),
+                    ]).lower()
+                    if any(term in searchable for term in terms):
+                        filtered.append(el)
+                elements = filtered
+
+        # Paging
+        total_count = len(elements)
+        offset = max(0, offset)
+        if limit > 0:
+            page = elements[offset:offset + limit]
+        else:
+            page = elements[offset:]
+
+        # Strip the full elements list and windows from result to keep output small
+        result.pop("elements", None)
+        result.pop("windows", None)
+        ui_info = result.pop("ui_elements", {})
+
+        return json.dumps({
+            **result,
+            "time_s": ui_info.get("time_s"),
+            "total_count": total_count,
+            "offset": offset,
+            "limit": limit if limit > 0 else None,
+            "returned": len(page),
+            "has_more": offset + len(page) < total_count,
+            "elements": page,
+        }, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_focused_element(
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 60,
+    region: list = None,
+    max_depth: int = 40,
+) -> str:
+    """Get the currently keyboard-focused accessible element."""
+    try:
+        app_filter = _resolve_window_title_pattern(title_pattern, use_regex, threshold)
+        result = get_focused_ui_element_deep(
+            app_filter=app_filter,
+            region=region,
+            max_depth=max_depth,
+        )
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_element_at_point(
+    x: int,
+    y: int,
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 60,
+    max_depth: int = 40,
+) -> str:
+    """Hit-test the accessibility tree at a screen point."""
+    try:
+        app_filter = _resolve_window_title_pattern(title_pattern, use_regex, threshold)
+        result = get_ui_element_at_point_deep(
+            x=x,
+            y=y,
+            app_filter=app_filter,
+            max_depth=max_depth,
+        )
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_element_details(element_ref: Dict[str, Any]) -> str:
+    """Get rich details for a previously returned deep UI element ref."""
+    try:
+        return json.dumps(_get_ui_element_details_deep(element_ref), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_element_children(element_ref: Dict[str, Any], max_depth: int = 1) -> str:
+    """Get child/descendant elements for a previously returned deep UI element ref."""
+    try:
+        return json.dumps(_get_ui_element_children_deep(element_ref, max_depth=max_depth), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_element_parent(element_ref: Dict[str, Any]) -> str:
+    """Get the parent accessible element for a previously returned deep UI element ref."""
+    try:
+        return json.dumps(_get_ui_element_parent_deep(element_ref), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def ui_action(
+    element_ref: Dict[str, Any],
+    action: str,
+    text: str = None,
+    value: float = None,
+    x: int = None,
+    y: int = None,
+    width: int = None,
+    height: int = None,
+) -> str:
+    """Perform a semantic UI automation / AT-SPI action on an element ref."""
+    try:
+        result = _perform_ui_action_deep(
+            element_ref=element_ref,
+            action=action,
+            text=text,
+            value=value,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+        )
+        return json.dumps(result, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def focus_element(element_ref: Dict[str, Any]) -> str:
+    return ui_action(element_ref=element_ref, action="focus")
+
+
+@mcp.tool()
+def invoke_element(element_ref: Dict[str, Any]) -> str:
+    return ui_action(element_ref=element_ref, action="invoke")
+
+
+@mcp.tool()
+def set_element_text(element_ref: Dict[str, Any], text: str, append: bool = False) -> str:
+    return ui_action(
+        element_ref=element_ref,
+        action="append_text" if append else "set_text",
+        text=text,
+    )
+
+
+@mcp.tool()
+def get_element_text(element_ref: Dict[str, Any]) -> str:
+    return ui_action(element_ref=element_ref, action="get_text")
+
+
+@mcp.tool()
+def toggle_element(element_ref: Dict[str, Any]) -> str:
+    return ui_action(element_ref=element_ref, action="toggle")
+
+
+@mcp.tool()
+def select_element(element_ref: Dict[str, Any]) -> str:
+    return ui_action(element_ref=element_ref, action="select")
+
+
+@mcp.tool()
+def expand_element(element_ref: Dict[str, Any]) -> str:
+    return ui_action(element_ref=element_ref, action="expand")
+
+
+@mcp.tool()
+def collapse_element(element_ref: Dict[str, Any]) -> str:
+    return ui_action(element_ref=element_ref, action="collapse")
+
+
+@mcp.tool()
+def scroll_element_into_view(element_ref: Dict[str, Any]) -> str:
+    return ui_action(element_ref=element_ref, action="scroll_into_view")
+
+
+@mcp.tool()
+def set_element_range_value(element_ref: Dict[str, Any], value: float) -> str:
+    return ui_action(element_ref=element_ref, action="set_range_value", value=value)
+
+
+@mcp.tool()
+def move_element_ui(element_ref: Dict[str, Any], x: int, y: int) -> str:
+    return ui_action(element_ref=element_ref, action="move", x=x, y=y)
+
+
+@mcp.tool()
+def resize_element_ui(element_ref: Dict[str, Any], width: int, height: int) -> str:
+    return ui_action(element_ref=element_ref, action="resize", width=width, height=height)
+
+
+@mcp.tool()
+def set_element_extents(element_ref: Dict[str, Any], x: int, y: int, width: int, height: int) -> str:
+    return ui_action(
+        element_ref=element_ref,
+        action="set_extents",
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+    )
+
+
+@mcp.tool()
+def get_active_window() -> str:
+    """Get the current foreground/active window."""
+    try:
+        window = gw.getActiveWindow()
+        if not window:
+            return json.dumps({"found": False, "error": "No active window"})
+        return json.dumps({
+            "found": True,
+            "title": window.title,
+            "left": window.left,
+            "top": window.top,
+            "width": window.width,
+            "height": window.height,
+            "is_minimized": window.isMinimized,
+            "is_maximized": window.isMaximized,
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def wait_for_window(
+    title_pattern: str,
+    mode: str = "appear",
+    use_regex: bool = False,
+    threshold: int = 60,
+    timeout_ms: int = 10000,
+    poll_interval_ms: int = 250,
+) -> str:
+    """Wait for a window to appear, disappear, or become active."""
+    try:
+        timeout_ms = min(max(timeout_ms, 100), 60000)
+        poll_interval_ms = max(poll_interval_ms, 50)
+        if mode not in ("appear", "disappear", "active"):
+            return json.dumps({"error": f"mode must be 'appear', 'disappear', or 'active', got '{mode}'"})
+
+        start = time.monotonic()
+        polls = 0
+        while True:
+            polls += 1
+            window, _ = _get_window_obj(title_pattern, use_regex, threshold)
+            found = window is not None
+            active = bool(found and getattr(window, "isActive", False))
+            elapsed_ms = round((time.monotonic() - start) * 1000)
+
+            if mode == "appear" and found:
+                return json.dumps({
+                    "found": True,
+                    "active": active,
+                    "elapsed_ms": elapsed_ms,
+                    "polls": polls,
+                    "timed_out": False,
+                    "title": window.title,
+                })
+            if mode == "disappear" and not found:
+                return json.dumps({
+                    "found": False,
+                    "active": False,
+                    "elapsed_ms": elapsed_ms,
+                    "polls": polls,
+                    "timed_out": False,
+                })
+            if mode == "active" and active:
+                return json.dumps({
+                    "found": True,
+                    "active": True,
+                    "elapsed_ms": elapsed_ms,
+                    "polls": polls,
+                    "timed_out": False,
+                    "title": window.title,
+                })
+
+            if elapsed_ms >= timeout_ms:
+                return json.dumps({
+                    "found": found,
+                    "active": active,
+                    "elapsed_ms": elapsed_ms,
+                    "polls": polls,
+                    "timed_out": True,
+                })
+
+            await asyncio.sleep(poll_interval_ms / 1000.0)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+async def wait_for_focused_element(
+    title_pattern: str = None,
+    use_regex: bool = False,
+    threshold: int = 60,
+    name_filter: str = None,
+    role_filter: str = None,
+    timeout_ms: int = 10000,
+    poll_interval_ms: int = 250,
+    max_depth: int = 40,
+) -> str:
+    """Wait until the currently focused accessible element matches name/role filters."""
+    try:
+        timeout_ms = min(max(timeout_ms, 100), 60000)
+        poll_interval_ms = max(poll_interval_ms, 50)
+        app_filter = _resolve_window_title_pattern(title_pattern, use_regex, threshold)
+
+        start = time.monotonic()
+        polls = 0
+        while True:
+            polls += 1
+            result = get_focused_ui_element_deep(app_filter=app_filter, max_depth=max_depth)
+            element = result.get("element")
+            matched = False
+            if element:
+                matched = (
+                    _matches_pipe_filter(element.get("name", ""), name_filter) and
+                    _matches_pipe_filter(element.get("role", ""), role_filter)
+                )
+            elapsed_ms = round((time.monotonic() - start) * 1000)
+
+            if matched:
+                return json.dumps({
+                    "found": True,
+                    "elapsed_ms": elapsed_ms,
+                    "polls": polls,
+                    "timed_out": False,
+                    "element": element,
+                }, default=str)
+
+            if elapsed_ms >= timeout_ms:
+                return json.dumps({
+                    "found": False,
+                    "elapsed_ms": elapsed_ms,
+                    "polls": polls,
+                    "timed_out": True,
+                    "element": element,
+                }, default=str)
+
+            await asyncio.sleep(poll_interval_ms / 1000.0)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()

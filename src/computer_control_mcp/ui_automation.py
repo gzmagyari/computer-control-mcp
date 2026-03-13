@@ -141,6 +141,7 @@ def _make_element(
     actions: Optional[List[str]] = None,
     depth: int = 0,
     text: str = "",
+    **extras: Any,
 ) -> Dict[str, Any]:
     """Create a normalized UI element dict with abs_center computed from bounds."""
     entry = {"role": role, "depth": depth}
@@ -154,6 +155,10 @@ def _make_element(
         entry["abs_center_y"] = bounds["y"] + bounds["h"] // 2
     if actions:
         entry["actions"] = actions
+    for key, value in extras.items():
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+        entry[key] = value
     return entry
 
 
@@ -186,6 +191,31 @@ def _filter_apps_by_region(all_apps: List[Dict], region: list) -> Tuple[List[Dic
                 "elements": kept,
             })
     return filtered_apps, removed
+
+
+def _flatten_applications(apps: List[Dict]) -> List[Dict]:
+    flat: List[Dict] = []
+    for app in apps:
+        flat.extend(app.get("elements", []))
+    return flat
+
+
+def _element_contains_point(el: Dict[str, Any], x: int, y: int) -> bool:
+    b = el.get("bounds")
+    if not b:
+        return False
+    return b["x"] <= x <= (b["x"] + b["w"]) and b["y"] <= y <= (b["y"] + b["h"])
+
+
+def _compact_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        k: v for k, v in data.items()
+        if v is not None and v != "" and v != [] and v != {}
+    }
+
+
+def _sanitize_match_text(value: str) -> str:
+    return re.sub(r'[\u200b\u200c\u200d\ufeff]', '', (value or '')).strip().lower()
 
 
 # ── Windows UIA Implementation ──────────────────────────────────────────
@@ -548,6 +578,8 @@ if sys.platform != "win32":
 
 def _get_windows_stacking_order_linux() -> List[Dict]:
     """Get windows with geometry from wmctrl, ordered by stacking (bottom to top)."""
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        return []
     env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":1")}
 
     # Get stacking order (bottom to top)
@@ -702,6 +734,14 @@ def _match_app_to_windows_linux(
 
 def _get_screen_size_linux() -> Tuple[int, int]:
     """Get screen dimensions on Linux via xdpyinfo or fallback."""
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        try:
+            import mss
+            with mss.mss() as sct:
+                mon = sct.monitors[0]
+                return mon["width"], mon["height"]
+        except Exception:
+            pass
     try:
         env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":1")}
         result = subprocess.run(
@@ -815,6 +855,12 @@ def _get_ui_elements_linux(app_filter: Optional[str] = None) -> Dict:
     return {
         "available": True,
         "error": None,
+        "warning": (
+            "Wayland session detected; AT-SPI is available, but X11-based window stacking/"
+            "occlusion data may be incomplete."
+            if (os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" or os.environ.get("WAYLAND_DISPLAY"))
+            else None
+        ),
         "screen": {"width": screen_w, "height": screen_h},
         "windows": windows,
         "ui_elements": {
@@ -824,6 +870,1219 @@ def _get_ui_elements_linux(app_filter: Optional[str] = None) -> Dict:
             "applications": all_apps,
         },
     }
+
+
+# ── Deep UI Automation / AT-SPI Helpers ────────────────────────────────
+
+
+def _uia_pattern_names(control) -> List[str]:
+    mapping = [
+        ("invoke", "IsInvokePatternAvailable"),
+        ("value", "IsValuePatternAvailable"),
+        ("text", "IsTextPatternAvailable"),
+        ("selection", "IsSelectionPatternAvailable"),
+        ("selection_item", "IsSelectionItemPatternAvailable"),
+        ("toggle", "IsTogglePatternAvailable"),
+        ("expand_collapse", "IsExpandCollapsePatternAvailable"),
+        ("scroll", "IsScrollPatternAvailable"),
+        ("scroll_item", "IsScrollItemPatternAvailable"),
+        ("range_value", "IsRangeValuePatternAvailable"),
+        ("transform", "IsTransformPatternAvailable"),
+        ("window", "IsWindowPatternAvailable"),
+        ("legacy_iaccessible", "IsLegacyIAccessiblePatternAvailable"),
+    ]
+    out: List[str] = []
+    for name, attr in mapping:
+        try:
+            if bool(getattr(control, attr)):
+                out.append(name)
+        except Exception:
+            pass
+    return out
+
+
+def _uia_state_flags(control) -> Dict[str, Any]:
+    mapping = [
+        ("enabled", "IsEnabled"),
+        ("keyboard_focusable", "IsKeyboardFocusable"),
+        ("has_keyboard_focus", "HasKeyboardFocus"),
+        ("offscreen", "IsOffscreen"),
+        ("password", "IsPassword"),
+        ("content_element", "IsContentElement"),
+        ("control_element", "IsControlElement"),
+    ]
+    out: Dict[str, Any] = {}
+    for key, attr in mapping:
+        try:
+            out[key] = bool(getattr(control, attr))
+        except Exception:
+            pass
+    return out
+
+
+def _uia_text_value_snapshot(control, max_chars: int = 2000) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    try:
+        value_pattern = control.GetValuePattern()
+        if value_pattern:
+            value = getattr(value_pattern, "Value", None)
+            if value is not None:
+                result["value"] = str(value)[:max_chars]
+    except Exception:
+        pass
+    try:
+        text_pattern = control.GetTextPattern()
+        if text_pattern and getattr(text_pattern, "DocumentRange", None):
+            text = text_pattern.DocumentRange.GetText(max_chars)
+            if text:
+                result["text"] = text[:max_chars]
+    except Exception:
+        pass
+    if "text" not in result:
+        try:
+            name = control.Name or ""
+            if name:
+                result["text"] = name[:max_chars]
+        except Exception:
+            pass
+    return result
+
+
+def _atspi_interface_names(node) -> List[str]:
+    checks = [
+        ("action", "get_action_iface"),
+        ("component", "get_component_iface"),
+        ("text", "get_text_iface"),
+        ("editable_text", "get_editable_text_iface"),
+        ("value", "get_value_iface"),
+        ("selection", "get_selection_iface"),
+        ("document", "get_document_iface"),
+        ("image", "get_image_iface"),
+        ("table", "get_table_iface"),
+        ("hypertext", "get_hypertext_iface"),
+    ]
+    out: List[str] = []
+    for name, getter_name in checks:
+        try:
+            getter = getattr(node, getter_name)
+            if getter() is not None:
+                out.append(name)
+        except Exception:
+            pass
+    return out
+
+
+def _atspi_state_names(node) -> List[str]:
+    out: List[str] = []
+    try:
+        ss = node.get_state_set()
+        for st in ss.get_states():
+            value = getattr(st, "value_nick", None) or getattr(st, "value_name", None) or str(st)
+            out.append(str(value).lower())
+    except Exception:
+        pass
+    return out
+
+
+def _atspi_text_value_snapshot(node, max_chars: int = 2000) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    try:
+        ti = node.get_text_iface()
+        if ti:
+            count = ti.get_character_count()
+            result["text"] = ti.get_text(0, min(count, max_chars))
+    except Exception:
+        pass
+    try:
+        vi = node.get_value_iface()
+        if vi:
+            try:
+                value_text = vi.get_text()
+                if value_text:
+                    result["value"] = value_text[:max_chars]
+            except Exception:
+                result["value"] = str(vi.get_current_value())
+    except Exception:
+        pass
+    if "text" not in result:
+        try:
+            name = node.get_name() or ""
+            if name:
+                result["text"] = name[:max_chars]
+        except Exception:
+            pass
+    return result
+
+
+def _collect_uia_elements_deep(
+    control,
+    app_name: str,
+    window_ids: List[str],
+    path: Optional[List[int]] = None,
+    depth: int = 0,
+    max_depth: int = 40,
+) -> List[Dict[str, Any]]:
+    if control is None or depth > max_depth:
+        return []
+
+    path = list(path or [])
+
+    try:
+        control_type = control.ControlTypeName
+        role = _UIA_ROLE_MAP.get(control_type, control_type.replace("Control", "").lower())
+    except Exception:
+        role = "unknown"
+
+    name = ""
+    try:
+        name = control.Name or ""
+    except Exception:
+        pass
+
+    bounds = None
+    try:
+        rect = control.BoundingRectangle
+        if rect.width() > 0 and rect.height() > 0 and rect.left >= 0 and rect.top >= 0:
+            bounds = {
+                "x": int(rect.left),
+                "y": int(rect.top),
+                "w": int(rect.width()),
+                "h": int(rect.height()),
+            }
+    except Exception:
+        pass
+
+    children = []
+    try:
+        children = control.GetChildren() or []
+    except Exception:
+        children = []
+
+    states = _uia_state_flags(control)
+    patterns = _uia_pattern_names(control)
+    snapshot = _uia_text_value_snapshot(control)
+
+    element_ref = _compact_dict({
+        "backend": "uia",
+        "app": app_name,
+        "window_ids": window_ids,
+        "path": path,
+        "role": role,
+        "name": name,
+        "bounds": bounds,
+    })
+
+    element = _make_element(
+        role=role,
+        name=name,
+        bounds=bounds,
+        actions=patterns or None,
+        depth=depth,
+        text=snapshot.get("text", ""),
+        value=snapshot.get("value"),
+        backend="uia",
+        application=app_name,
+        window_ids=window_ids,
+        ref=element_ref,
+        patterns=patterns,
+        states=states,
+        child_count=len(children),
+        automation_id=getattr(control, "AutomationId", None),
+        class_name=getattr(control, "ClassName", None),
+        framework_id=getattr(control, "FrameworkId", None),
+        process_id=getattr(control, "ProcessId", None),
+        native_window_handle=getattr(control, "NativeWindowHandle", None),
+        description=getattr(control, "HelpText", None),
+        keyboard_shortcut=(getattr(control, "AccessKey", None) or getattr(control, "AcceleratorKey", None)),
+        localized_control_type=getattr(control, "LocalizedControlType", None),
+    )
+
+    elements = [element]
+    for idx, child in enumerate(children):
+        elements.extend(
+            _collect_uia_elements_deep(
+                child,
+                app_name=app_name,
+                window_ids=window_ids,
+                path=path + [idx],
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
+        )
+    return elements
+
+
+def _collect_atspi_elements_deep(
+    node,
+    app_name: str,
+    window_ids: List[str],
+    path: Optional[List[int]] = None,
+    depth: int = 0,
+    max_depth: int = 40,
+) -> List[Dict[str, Any]]:
+    if node is None or depth > max_depth:
+        return []
+
+    path = list(path or [])
+
+    try:
+        role = node.get_role_name()
+    except Exception:
+        role = "unknown"
+
+    try:
+        name = node.get_name() or ""
+    except Exception:
+        name = ""
+
+    bounds = None
+    try:
+        comp = node.get_component_iface()
+        if comp is not None:
+            r = comp.get_extents(Atspi.CoordType.SCREEN)
+            if r.width > 0 and r.height > 0 and r.x >= 0 and r.y >= 0:
+                bounds = {"x": r.x, "y": r.y, "w": r.width, "h": r.height}
+    except Exception:
+        pass
+
+    snapshot = _atspi_text_value_snapshot(node)
+    states = _atspi_state_names(node)
+    interfaces = _atspi_interface_names(node)
+
+    actions: List[str] = []
+    try:
+        ai = node.get_action_iface()
+        if ai:
+            for i in range(ai.get_n_actions()):
+                try:
+                    actions.append(ai.get_action_name(i))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    child_count = 0
+    try:
+        child_count = node.get_child_count()
+    except Exception:
+        pass
+
+    description = None
+    try:
+        description = node.get_description() or None
+    except Exception:
+        pass
+
+    element_ref = _compact_dict({
+        "backend": "atspi",
+        "app": app_name,
+        "window_ids": window_ids,
+        "path": path,
+        "role": role,
+        "name": name,
+        "bounds": bounds,
+    })
+
+    element = _make_element(
+        role=role,
+        name=name,
+        bounds=bounds,
+        actions=actions or None,
+        depth=depth,
+        text=snapshot.get("text", ""),
+        value=snapshot.get("value"),
+        backend="atspi",
+        application=app_name,
+        window_ids=window_ids,
+        ref=element_ref,
+        interfaces=interfaces,
+        states=states,
+        child_count=child_count,
+        description=description,
+    )
+
+    elements = [element]
+    for i in range(child_count):
+        try:
+            child = node.get_child_at_index(i)
+        except Exception:
+            continue
+        elements.extend(
+            _collect_atspi_elements_deep(
+                child,
+                app_name=app_name,
+                window_ids=window_ids,
+                path=path + [i],
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
+        )
+    return elements
+
+
+def _get_deep_ui_elements_win32(
+    app_filter: Optional[str] = None,
+    include_hidden: bool = False,
+    max_depth: int = 40,
+) -> Dict[str, Any]:
+    import pyautogui
+
+    try:
+        import ctypes
+        ctypes.windll.ole32.CoInitialize(None)
+    except Exception:
+        pass
+
+    screen_w, screen_h = pyautogui.size()
+    t0 = time.perf_counter()
+
+    windows = _get_windows_stacking_order_win32()
+    visible_regions = _compute_visible_regions(windows, screen_w, screen_h)
+
+    all_apps = []
+    total_before = 0
+    total_after = 0
+    app_filter_lower = _sanitize_match_text(app_filter) if app_filter else None
+
+    try:
+        root = auto.GetRootControl()
+        top_level_windows = root.GetChildren()
+
+        for uia_window in (top_level_windows or []):
+            try:
+                app_name = uia_window.Name or "unknown"
+            except Exception:
+                app_name = "unknown"
+
+            if app_filter_lower and app_filter_lower not in _sanitize_match_text(app_name):
+                continue
+
+            win_ids = _match_uia_window_to_stacking(uia_window, windows)
+            elements = _collect_uia_elements_deep(
+                uia_window,
+                app_name=app_name,
+                window_ids=win_ids,
+                path=[],
+                depth=0,
+                max_depth=max_depth,
+            )
+            total_before += len(elements)
+
+            if include_hidden:
+                filtered = elements
+            else:
+                filtered = []
+                all_regions = []
+                for wid in win_ids:
+                    all_regions.extend(visible_regions.get(wid, []))
+                if not all_regions:
+                    all_regions = [(0, 0, screen_w, screen_h)]
+                for el in elements:
+                    b = el.get("bounds")
+                    if not b:
+                        continue
+                    if _rect_mostly_in_regions(b["x"], b["y"], b["w"], b["h"], all_regions, threshold=0.6):
+                        filtered.append(el)
+
+            if filtered:
+                all_apps.append({
+                    "application": app_name,
+                    "window_ids": win_ids,
+                    "elements": filtered,
+                })
+                total_after += len(filtered)
+    except Exception as e:
+        return {
+            "available": True,
+            "backend": "uia",
+            "error": f"Error collecting deep UIA elements: {str(e)}",
+            "screen": {"width": screen_w, "height": screen_h},
+            "windows": [{k: v for k, v in w.items() if k != "hwnd"} for w in windows],
+            "ui_elements": {
+                "time_s": round(time.perf_counter() - t0, 3),
+                "element_count": 0,
+                "filtered_out": 0,
+                "applications": [],
+            },
+        }
+
+    return {
+        "available": True,
+        "backend": "uia",
+        "error": None,
+        "screen": {"width": screen_w, "height": screen_h},
+        "windows": [{k: v for k, v in w.items() if k != "hwnd"} for w in windows],
+        "ui_elements": {
+            "time_s": round(time.perf_counter() - t0, 3),
+            "element_count": total_after,
+            "filtered_out": total_before - total_after,
+            "applications": all_apps,
+        },
+    }
+
+
+def _get_deep_ui_elements_linux(
+    app_filter: Optional[str] = None,
+    include_hidden: bool = False,
+    max_depth: int = 40,
+) -> Dict[str, Any]:
+    screen_w, screen_h = _get_screen_size_linux()
+    t0 = time.perf_counter()
+
+    windows = _get_windows_stacking_order_linux()
+    visible_regions = _compute_visible_regions(windows, screen_w, screen_h)
+
+    all_apps = []
+    total_before = 0
+    total_after = 0
+    app_filter_lower = _sanitize_match_text(app_filter) if app_filter else None
+
+    try:
+        desktop = Atspi.get_desktop(0)
+
+        for i in range(desktop.get_child_count()):
+            try:
+                app = desktop.get_child_at_index(i)
+                app_name = app.get_name() or f"app_{i}"
+            except Exception:
+                continue
+
+            if app_filter_lower and app_filter_lower not in _sanitize_match_text(app_name):
+                continue
+
+            elements = _collect_atspi_elements_deep(
+                app,
+                app_name=app_name,
+                window_ids=[],
+                path=[],
+                depth=0,
+                max_depth=max_depth,
+            )
+            total_before += len(elements)
+
+            win_ids = _match_app_to_windows_linux(app_name, elements, windows)
+
+            if include_hidden:
+                filtered = elements
+            else:
+                filtered = []
+                all_regions = []
+                for wid in win_ids:
+                    all_regions.extend(visible_regions.get(wid, []))
+                if not all_regions:
+                    all_regions = [(0, 0, screen_w, screen_h)]
+                for el in elements:
+                    b = el.get("bounds")
+                    if not b:
+                        continue
+                    if _rect_mostly_in_regions(b["x"], b["y"], b["w"], b["h"], all_regions, threshold=0.6):
+                        filtered.append(el)
+
+            if filtered:
+                for el in filtered:
+                    el["window_ids"] = win_ids
+                    if "ref" in el:
+                        el["ref"]["window_ids"] = win_ids
+                all_apps.append({
+                    "application": app_name,
+                    "window_ids": win_ids,
+                    "elements": filtered,
+                })
+                total_after += len(filtered)
+    except Exception as e:
+        return {
+            "available": True,
+            "backend": "atspi",
+            "error": f"Error collecting deep AT-SPI elements: {str(e)}",
+            "screen": {"width": screen_w, "height": screen_h},
+            "windows": windows,
+            "ui_elements": {
+                "time_s": round(time.perf_counter() - t0, 3),
+                "element_count": 0,
+                "filtered_out": 0,
+                "applications": [],
+            },
+        }
+
+    return {
+        "available": True,
+        "backend": "atspi",
+        "error": None,
+        "screen": {"width": screen_w, "height": screen_h},
+        "windows": windows,
+        "ui_elements": {
+            "time_s": round(time.perf_counter() - t0, 3),
+            "element_count": total_after,
+            "filtered_out": total_before - total_after,
+            "applications": all_apps,
+        },
+    }
+
+
+def _uia_follow_path(control, path: List[int]):
+    current = control
+    for idx in path:
+        try:
+            children = current.GetChildren() or []
+        except Exception:
+            return None
+        if idx < 0 or idx >= len(children):
+            return None
+        current = children[idx]
+    return current
+
+
+def _atspi_follow_path(node, path: List[int]):
+    current = node
+    for idx in path:
+        try:
+            current = current.get_child_at_index(idx)
+        except Exception:
+            return None
+    return current
+
+
+def _resolve_uia_element(ref: Dict[str, Any]) -> Dict[str, Any]:
+    target_app = _sanitize_match_text(ref.get("app", ""))
+    target_ids = set(ref.get("window_ids") or [])
+    target_path = list(ref.get("path") or [])
+
+    windows = _get_windows_stacking_order_win32()
+    try:
+        root = auto.GetRootControl()
+        for top in (root.GetChildren() or []):
+            app_name = getattr(top, "Name", "") or ""
+            app_name_clean = _sanitize_match_text(app_name)
+            if target_app and target_app not in app_name_clean and app_name_clean not in target_app:
+                continue
+            candidate_ids = set(_match_uia_window_to_stacking(top, windows))
+            if target_ids and not (candidate_ids & target_ids):
+                continue
+            node = _uia_follow_path(top, target_path)
+            if node is None:
+                continue
+            return {
+                "success": True,
+                "backend": "uia",
+                "node": node,
+                "app_name": app_name,
+                "window_ids": list(candidate_ids or target_ids),
+            }
+    except Exception as e:
+        return {"success": False, "backend": "uia", "error": str(e)}
+    return {"success": False, "backend": "uia", "error": "Element reference could not be resolved"}
+
+
+def _resolve_atspi_element(ref: Dict[str, Any]) -> Dict[str, Any]:
+    target_app = _sanitize_match_text(ref.get("app", ""))
+    target_path = list(ref.get("path") or [])
+
+    try:
+        desktop = Atspi.get_desktop(0)
+        for i in range(desktop.get_child_count()):
+            try:
+                app = desktop.get_child_at_index(i)
+                app_name = app.get_name() or f"app_{i}"
+            except Exception:
+                continue
+            app_name_clean = _sanitize_match_text(app_name)
+            if target_app and target_app not in app_name_clean and app_name_clean not in target_app:
+                continue
+            node = _atspi_follow_path(app, target_path)
+            if node is None:
+                continue
+            return {
+                "success": True,
+                "backend": "atspi",
+                "node": node,
+                "app_name": app_name,
+                "window_ids": ref.get("window_ids") or [],
+            }
+    except Exception as e:
+        return {"success": False, "backend": "atspi", "error": str(e)}
+    return {"success": False, "backend": "atspi", "error": "Element reference could not be resolved"}
+
+
+def _resolve_ui_element(ref: Dict[str, Any]) -> Dict[str, Any]:
+    backend = ref.get("backend")
+    if backend == "uia":
+        return _resolve_uia_element(ref)
+    if backend == "atspi":
+        return _resolve_atspi_element(ref)
+    return {"success": False, "error": f"Unsupported element ref backend: {backend}"}
+
+
+def _pick_atspi_named_action(node, candidates: List[str]) -> Optional[Tuple[Any, int, str]]:
+    try:
+        ai = node.get_action_iface()
+        if not ai:
+            return None
+        for i in range(ai.get_n_actions()):
+            try:
+                name = (ai.get_action_name(i) or "").strip().lower()
+            except Exception:
+                continue
+            for candidate in candidates:
+                if name == candidate or candidate in name:
+                    return ai, i, name
+    except Exception:
+        pass
+    return None
+
+
+def find_ui_elements_deep(
+    app_filter: Optional[str] = None,
+    region: Optional[list] = None,
+    name_filter: Optional[str] = None,
+    role_filter: Optional[str] = None,
+    interactable_only: bool = False,
+    include_hidden: bool = False,
+    max_depth: int = 40,
+) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        if not UI_AUTOMATION_AVAILABLE:
+            return {
+                "available": False,
+                "backend": "uia",
+                "error": "uiautomation/pywin32 not installed",
+                "elements": [],
+                "windows": [],
+                "screen": {"width": 0, "height": 0},
+            }
+        result = _get_deep_ui_elements_win32(app_filter=app_filter, include_hidden=include_hidden, max_depth=max_depth)
+    else:
+        if not ATSPI_AVAILABLE:
+            return {
+                "available": False,
+                "backend": "atspi",
+                "error": "AT-SPI not available",
+                "elements": [],
+                "windows": [],
+                "screen": {"width": 0, "height": 0},
+            }
+        result = _get_deep_ui_elements_linux(app_filter=app_filter, include_hidden=include_hidden, max_depth=max_depth)
+
+    if not result.get("available"):
+        result["elements"] = []
+        return result
+
+    if region and result.get("ui_elements", {}).get("applications"):
+        apps = result["ui_elements"]["applications"]
+        filtered_apps, removed = _filter_apps_by_region(apps, region)
+        result["ui_elements"]["applications"] = filtered_apps
+        result["ui_elements"]["filtered_out"] = result["ui_elements"].get("filtered_out", 0) + removed
+        result["ui_elements"]["element_count"] = sum(len(a["elements"]) for a in filtered_apps)
+
+    if (name_filter or role_filter or interactable_only) and result.get("ui_elements", {}).get("applications"):
+        new_apps = []
+        removed_total = 0
+        for app in result["ui_elements"]["applications"]:
+            original_count = len(app["elements"])
+            kept = _filter_elements(app["elements"], name_filter, role_filter, interactable_only)
+            removed_total += original_count - len(kept)
+            if kept:
+                new_apps.append({
+                    "application": app["application"],
+                    "window_ids": app.get("window_ids", []),
+                    "elements": kept,
+                })
+        result["ui_elements"]["applications"] = new_apps
+        result["ui_elements"]["filtered_out"] = result["ui_elements"].get("filtered_out", 0) + removed_total
+        result["ui_elements"]["element_count"] = sum(len(a["elements"]) for a in new_apps)
+
+    flat = _flatten_applications(result["ui_elements"]["applications"])
+    flat.sort(key=lambda e: (
+        (e.get("bounds") or {}).get("y", 10**9),
+        (e.get("bounds") or {}).get("x", 10**9),
+        e.get("depth", 0),
+    ))
+    result["elements"] = flat
+    return result
+
+
+def get_focused_ui_element_deep(
+    app_filter: Optional[str] = None,
+    region: Optional[list] = None,
+    max_depth: int = 40,
+) -> Dict[str, Any]:
+    result = find_ui_elements_deep(
+        app_filter=app_filter,
+        region=region,
+        include_hidden=True,
+        max_depth=max_depth,
+    )
+    if not result.get("available"):
+        return result
+
+    candidates = []
+    for el in result.get("elements", []):
+        if el.get("backend") == "uia":
+            if el.get("states", {}).get("has_keyboard_focus"):
+                candidates.append(el)
+        else:
+            if "focused" in (el.get("states") or []):
+                candidates.append(el)
+
+    if not candidates:
+        return {
+            "available": True,
+            "backend": result.get("backend"),
+            "found": False,
+            "element": None,
+        }
+
+    candidates.sort(key=lambda e: (
+        -(e.get("depth", 0)),
+        ((e.get("bounds") or {}).get("w", 10**9) * (e.get("bounds") or {}).get("h", 10**9)),
+    ))
+    return {
+        "available": True,
+        "backend": result.get("backend"),
+        "found": True,
+        "element": candidates[0],
+    }
+
+
+def get_ui_element_at_point_deep(
+    x: int,
+    y: int,
+    app_filter: Optional[str] = None,
+    max_depth: int = 40,
+) -> Dict[str, Any]:
+    result = find_ui_elements_deep(
+        app_filter=app_filter,
+        include_hidden=False,
+        max_depth=max_depth,
+    )
+    if not result.get("available"):
+        return result
+
+    matches = [el for el in result.get("elements", []) if _element_contains_point(el, x, y)]
+    if not matches:
+        return {
+            "available": True,
+            "backend": result.get("backend"),
+            "found": False,
+            "element": None,
+        }
+
+    matches.sort(key=lambda e: (
+        ((e.get("bounds") or {}).get("w", 10**9) * (e.get("bounds") or {}).get("h", 10**9)),
+        -(e.get("depth", 0)),
+    ))
+    return {
+        "available": True,
+        "backend": result.get("backend"),
+        "found": True,
+        "element": matches[0],
+    }
+
+
+def get_ui_element_details(element_ref: Dict[str, Any]) -> Dict[str, Any]:
+    resolved = _resolve_ui_element(element_ref)
+    if not resolved.get("success"):
+        return {"found": False, "error": resolved.get("error")}
+
+    if resolved["backend"] == "uia":
+        el = _collect_uia_elements_deep(
+            resolved["node"],
+            app_name=resolved["app_name"],
+            window_ids=resolved["window_ids"],
+            path=list(element_ref.get("path") or []),
+            depth=0,
+            max_depth=0,
+        )[0]
+    else:
+        el = _collect_atspi_elements_deep(
+            resolved["node"],
+            app_name=resolved["app_name"],
+            window_ids=resolved["window_ids"],
+            path=list(element_ref.get("path") or []),
+            depth=0,
+            max_depth=0,
+        )[0]
+    return {"found": True, "element": el}
+
+
+def get_ui_element_parent(element_ref: Dict[str, Any]) -> Dict[str, Any]:
+    resolved = _resolve_ui_element(element_ref)
+    if not resolved.get("success"):
+        return {"found": False, "error": resolved.get("error")}
+
+    parent_path = list(element_ref.get("path") or [])[:-1]
+    if resolved["backend"] == "uia":
+        try:
+            parent = resolved["node"].GetParentControl()
+        except Exception as e:
+            return {"found": False, "error": str(e)}
+        if not parent:
+            return {"found": False, "error": "No parent element"}
+        element = _collect_uia_elements_deep(
+            parent,
+            app_name=resolved["app_name"],
+            window_ids=resolved["window_ids"],
+            path=parent_path,
+            depth=0,
+            max_depth=0,
+        )[0]
+    else:
+        try:
+            parent = resolved["node"].get_parent()
+        except Exception as e:
+            return {"found": False, "error": str(e)}
+        if not parent:
+            return {"found": False, "error": "No parent element"}
+        element = _collect_atspi_elements_deep(
+            parent,
+            app_name=resolved["app_name"],
+            window_ids=resolved["window_ids"],
+            path=parent_path,
+            depth=0,
+            max_depth=0,
+        )[0]
+    return {"found": True, "element": element}
+
+
+def get_ui_element_children(element_ref: Dict[str, Any], max_depth: int = 1) -> Dict[str, Any]:
+    resolved = _resolve_ui_element(element_ref)
+    if not resolved.get("success"):
+        return {"found": False, "error": resolved.get("error")}
+
+    max_depth = max(1, max_depth)
+    base_path = list(element_ref.get("path") or [])
+    elements: List[Dict[str, Any]] = []
+
+    if resolved["backend"] == "uia":
+        try:
+            children = resolved["node"].GetChildren() or []
+        except Exception as e:
+            return {"found": False, "error": str(e)}
+        for idx, child in enumerate(children):
+            elements.extend(
+                _collect_uia_elements_deep(
+                    child,
+                    app_name=resolved["app_name"],
+                    window_ids=resolved["window_ids"],
+                    path=base_path + [idx],
+                    depth=1,
+                    max_depth=max_depth,
+                )
+            )
+    else:
+        try:
+            child_count = resolved["node"].get_child_count()
+        except Exception as e:
+            return {"found": False, "error": str(e)}
+        for idx in range(child_count):
+            try:
+                child = resolved["node"].get_child_at_index(idx)
+            except Exception:
+                continue
+            elements.extend(
+                _collect_atspi_elements_deep(
+                    child,
+                    app_name=resolved["app_name"],
+                    window_ids=resolved["window_ids"],
+                    path=base_path + [idx],
+                    depth=1,
+                    max_depth=max_depth,
+                )
+            )
+
+    return {"found": True, "element_count": len(elements), "elements": elements}
+
+
+def _perform_uia_action(
+    control,
+    action: str,
+    text: Optional[str] = None,
+    value: Optional[float] = None,
+    x: Optional[int] = None,
+    y: Optional[int] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+) -> Dict[str, Any]:
+    try:
+        if action == "focus":
+            try:
+                control.SetFocus()
+            except Exception:
+                control.SetActive()
+            return {"success": True, "message": "Focused element"}
+
+        if action in ("invoke", "click"):
+            try:
+                control.GetInvokePattern().Invoke()
+                return {"success": True, "message": "Invoked element"}
+            except Exception:
+                control.Click()
+                return {"success": True, "message": "Clicked element"}
+
+        if action == "get_text":
+            return {"success": True, **_uia_text_value_snapshot(control, max_chars=4000)}
+
+        if action in ("set_text", "append_text", "clear_text"):
+            target = text or ""
+            if action == "append_text":
+                snap = _uia_text_value_snapshot(control, max_chars=4000)
+                target = (snap.get("value") or snap.get("text") or "") + target
+            elif action == "clear_text":
+                target = ""
+            try:
+                control.GetValuePattern().SetValue(target)
+                return {"success": True, "message": f"{action} via ValuePattern"}
+            except Exception:
+                try:
+                    control.SetFocus()
+                except Exception:
+                    try:
+                        control.Click()
+                    except Exception:
+                        pass
+                try:
+                    control.SendKeys('{Ctrl}a{Del}')
+                except Exception:
+                    pass
+                if target:
+                    control.SendKeys(target)
+                return {"success": True, "message": f"{action} via SendKeys fallback"}
+
+        if action == "select":
+            try:
+                control.GetSelectionItemPattern().Select()
+            except Exception:
+                control.Select()
+            return {"success": True, "message": "Selected element"}
+
+        if action == "toggle":
+            control.GetTogglePattern().Toggle()
+            return {"success": True, "message": "Toggled element"}
+
+        if action == "expand":
+            control.GetExpandCollapsePattern().Expand()
+            return {"success": True, "message": "Expanded element"}
+
+        if action == "collapse":
+            control.GetExpandCollapsePattern().Collapse()
+            return {"success": True, "message": "Collapsed element"}
+
+        if action == "scroll_into_view":
+            control.GetScrollItemPattern().ScrollIntoView()
+            return {"success": True, "message": "Scrolled element into view"}
+
+        if action == "set_range_value":
+            if value is None:
+                return {"success": False, "error": "value is required for set_range_value"}
+            control.GetRangeValuePattern().SetValue(float(value))
+            return {"success": True, "message": f"Set range value to {value}"}
+
+        if action in ("move", "resize", "set_extents"):
+            tp = control.GetTransformPattern()
+            if action == "move":
+                if x is None or y is None:
+                    return {"success": False, "error": "x and y are required for move"}
+                tp.Move(x, y)
+                return {"success": True, "message": f"Moved element to ({x}, {y})"}
+            if action == "resize":
+                if width is None or height is None:
+                    return {"success": False, "error": "width and height are required for resize"}
+                tp.Resize(width, height)
+                return {"success": True, "message": f"Resized element to {width}x{height}"}
+            if x is None or y is None or width is None or height is None:
+                return {"success": False, "error": "x, y, width, height are required for set_extents"}
+            tp.Move(x, y)
+            tp.Resize(width, height)
+            return {"success": True, "message": f"Set element extents to ({x}, {y}, {width}, {height})"}
+
+        if action == "close":
+            try:
+                control.GetWindowPattern().Close()
+            except Exception:
+                control.GetTopLevelControl().GetWindowPattern().Close()
+            return {"success": True, "message": "Closed element/window"}
+
+        return {"success": False, "error": f"Unsupported UIA action: {action}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _perform_atspi_action(
+    node,
+    action: str,
+    text: Optional[str] = None,
+    value: Optional[float] = None,
+    x: Optional[int] = None,
+    y: Optional[int] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+) -> Dict[str, Any]:
+    try:
+        if action == "focus":
+            comp = node.get_component_iface()
+            if not comp:
+                return {"success": False, "error": "Component interface not available"}
+            ok = comp.grab_focus()
+            return {"success": bool(ok), "message": "Focused element" if ok else "Could not focus element"}
+
+        if action in ("invoke", "click"):
+            picked = _pick_atspi_named_action(node, ["click", "press", "activate", "open", "jump"])
+            if not picked:
+                return {"success": False, "error": "No actionable AT-SPI action found"}
+            ai, index, name = picked
+            ok = ai.do_action(index)
+            return {"success": bool(ok), "message": f"Ran AT-SPI action: {name}"}
+
+        if action == "get_text":
+            return {"success": True, **_atspi_text_value_snapshot(node, max_chars=4000)}
+
+        if action in ("set_text", "append_text", "clear_text"):
+            editable = node.get_editable_text_iface()
+            if not editable:
+                return {"success": False, "error": "EditableText interface not available"}
+            if action == "clear_text":
+                ok = editable.set_text_contents("")
+                return {"success": bool(ok), "message": "Cleared text"}
+            if action == "set_text":
+                ok = editable.set_text_contents(text or "")
+                return {"success": bool(ok), "message": "Set text"}
+            ti = node.get_text_iface()
+            if not ti:
+                return {"success": False, "error": "Text interface not available for append_text"}
+            count = ti.get_character_count()
+            payload = text or ""
+            ok = editable.insert_text(count, payload, len(payload.encode("utf-8")))
+            return {"success": bool(ok), "message": "Appended text"}
+
+        if action == "select":
+            picked = _pick_atspi_named_action(node, ["select", "activate", "click"])
+            if picked:
+                ai, index, name = picked
+                ok = ai.do_action(index)
+                return {"success": bool(ok), "message": f"Ran AT-SPI action: {name}"}
+            try:
+                parent = node.get_parent()
+                sel = parent.get_selection_iface() if parent else None
+                idx = node.get_index_in_parent()
+                if sel and idx >= 0:
+                    ok = sel.select_child(idx)
+                    return {"success": bool(ok), "message": "Selected element via Selection iface"}
+            except Exception:
+                pass
+            return {"success": False, "error": "No selection mechanism available"}
+
+        if action == "toggle":
+            picked = _pick_atspi_named_action(node, ["toggle", "press", "click", "activate"])
+            if not picked:
+                return {"success": False, "error": "No toggle-like AT-SPI action found"}
+            ai, index, name = picked
+            ok = ai.do_action(index)
+            return {"success": bool(ok), "message": f"Ran AT-SPI action: {name}"}
+
+        if action == "expand":
+            picked = _pick_atspi_named_action(node, ["expand", "open"])
+            if not picked:
+                return {"success": False, "error": "No expand-like AT-SPI action found"}
+            ai, index, name = picked
+            ok = ai.do_action(index)
+            return {"success": bool(ok), "message": f"Ran AT-SPI action: {name}"}
+
+        if action == "collapse":
+            picked = _pick_atspi_named_action(node, ["collapse", "close"])
+            if not picked:
+                return {"success": False, "error": "No collapse-like AT-SPI action found"}
+            ai, index, name = picked
+            ok = ai.do_action(index)
+            return {"success": bool(ok), "message": f"Ran AT-SPI action: {name}"}
+
+        if action == "scroll_into_view":
+            comp = node.get_component_iface()
+            if not comp:
+                return {"success": False, "error": "Component interface not available"}
+            ok = comp.scroll_to(Atspi.ScrollType.ANYWHERE)
+            return {"success": bool(ok), "message": "Scrolled element into view"}
+
+        if action == "set_range_value":
+            if value is None:
+                return {"success": False, "error": "value is required for set_range_value"}
+            vi = node.get_value_iface()
+            if not vi:
+                return {"success": False, "error": "Value interface not available"}
+            ok = vi.set_current_value(float(value))
+            return {"success": bool(ok), "message": f"Set range value to {value}"}
+
+        if action in ("move", "resize", "set_extents"):
+            comp = node.get_component_iface()
+            if not comp:
+                return {"success": False, "error": "Component interface not available"}
+            if action == "move":
+                if x is None or y is None:
+                    return {"success": False, "error": "x and y are required for move"}
+                ok = comp.set_position(x, y, Atspi.CoordType.SCREEN)
+                return {"success": bool(ok), "message": f"Moved element to ({x}, {y})"}
+            if action == "resize":
+                if width is None or height is None:
+                    return {"success": False, "error": "width and height are required for resize"}
+                ok = comp.set_size(width, height)
+                return {"success": bool(ok), "message": f"Resized element to {width}x{height}"}
+            if x is None or y is None or width is None or height is None:
+                return {"success": False, "error": "x, y, width, height are required for set_extents"}
+            ok = comp.set_extents(x, y, width, height, Atspi.CoordType.SCREEN)
+            return {"success": bool(ok), "message": f"Set element extents to ({x}, {y}, {width}, {height})"}
+
+        if action == "close":
+            picked = _pick_atspi_named_action(node, ["close"])
+            if not picked:
+                return {"success": False, "error": "No close-like AT-SPI action found"}
+            ai, index, name = picked
+            ok = ai.do_action(index)
+            return {"success": bool(ok), "message": f"Ran AT-SPI action: {name}"}
+
+        return {"success": False, "error": f"Unsupported AT-SPI action: {action}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def perform_ui_action(
+    element_ref: Dict[str, Any],
+    action: str,
+    text: Optional[str] = None,
+    value: Optional[float] = None,
+    x: Optional[int] = None,
+    y: Optional[int] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+) -> Dict[str, Any]:
+    resolved = _resolve_ui_element(element_ref)
+    if not resolved.get("success"):
+        return {"success": False, "error": resolved.get("error")}
+
+    if resolved["backend"] == "uia":
+        result = _perform_uia_action(
+            resolved["node"],
+            action=action,
+            text=text,
+            value=value,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+        )
+    else:
+        result = _perform_atspi_action(
+            resolved["node"],
+            action=action,
+            text=text,
+            value=value,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+        )
+
+    result["backend"] = resolved["backend"]
+    result["action"] = action
+    result["ref"] = element_ref
+    return result
 
 
 # ── Public API ──────────────────────────────────────────────────────────
