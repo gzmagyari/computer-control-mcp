@@ -193,6 +193,7 @@ This fork adds significant perception and automation capabilities for AI agents:
 | `wait_milliseconds(ms)` | Wait/sleep |
 | `perform_actions(actions)` | Execute a batch of actions sequentially |
 | `get_monitors()` | Get information about connected monitors |
+| `get_agent_guide()` | Get the full agent skill guide — best practices, workflows, and troubleshooting |
 
 ## Region Capture
 
@@ -307,6 +308,17 @@ get_text_bounds(element_ref={...}, start=4, end=19)  # → bounding rectangles
 ```
 
 Element refs survive minor UI changes (scrolling, focus shifts) but need re-discovery if the window title changes or the element tree restructures.
+
+## Built-in Agent Guide
+
+The MCP includes a built-in skill guide that any AI agent can retrieve at runtime:
+
+```python
+get_agent_guide()
+# → {"guide_path": "/path/to/AGENT_GUIDE.md", "message": "Read the file at guide_path..."}
+```
+
+Returns the file path to a comprehensive markdown guide (~50KB). The agent reads the file at that path to learn best practices, tool selection, workflows, and troubleshooting for all 85 tools. No external documentation or agent skill files needed — the guide ships with the pip package.
 
 ## Filesystem Watching
 

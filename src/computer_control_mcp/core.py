@@ -98,7 +98,17 @@ DEBUG = True  # Set to False in production
 RELOAD_ENABLED = True  # Set to False to disable auto-reload
 
 # Create FastMCP server instance at module level
-mcp = FastMCP("ComputerControlMCP")
+mcp = FastMCP(
+    "ComputerControlMCP",
+    instructions=(
+        "Computer Control MCP provides 85+ tools for desktop automation: mouse, keyboard, "
+        "screenshots, OCR, deep UI automation, text manipulation, process management, and more. "
+        "IMPORTANT: Before using any tools, call the 'get_agent_guide' tool first. It returns "
+        "a file path to a comprehensive skill guide — read that file to learn best practices, "
+        "tool selection, workflows, and troubleshooting. This will dramatically improve your "
+        "effectiveness with these tools."
+    ),
+)
 
 
 # Try to import Windows Graphics Capture API
@@ -5519,6 +5529,41 @@ def check_screen_changed_full(
     except Exception as e:
         log(f"Error in check_screen_changed_full: {str(e)}")
         return json.dumps({"error": str(e)})
+
+
+_AGENT_GUIDE_PATH = os.path.join(os.path.dirname(__file__), "AGENT_GUIDE.md")
+
+
+@mcp.tool()
+def get_agent_guide() -> str:
+    """Get the agent skill guide for using this MCP server effectively.
+
+    Returns the file path to a comprehensive markdown guide covering best
+    practices, tool selection, workflows, and troubleshooting. The agent
+    should read this file to learn how to use the available tools.
+
+    IMPORTANT: The response is a file path. Read the file at that path to
+    get the full guide content. Do NOT try to use the path as the guide itself.
+
+    The guide covers:
+    - Perception model (screenshot, UI automation, deep UI, OCR)
+    - Tool selection quick reference
+    - Screenshot optimization (format, quality, regions)
+    - Deep UI automation (element refs, semantic actions, text manipulation)
+    - Wait & polling tools, file system watching, process management
+    - Common workflows with step-by-step examples
+    - Troubleshooting common issues
+
+    Returns:
+        JSON with the file path to the agent guide markdown file.
+        Read the file at that path to get the full guide.
+    """
+    if os.path.isfile(_AGENT_GUIDE_PATH):
+        return json.dumps({
+            "guide_path": _AGENT_GUIDE_PATH,
+            "message": "Read the file at guide_path to get the full agent skill guide. It contains best practices, tool selection, workflows, and troubleshooting for all 85 tools.",
+        })
+    return json.dumps({"error": "Agent guide not found", "expected_path": _AGENT_GUIDE_PATH})
 
 
 def main():
