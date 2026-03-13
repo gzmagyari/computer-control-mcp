@@ -71,13 +71,15 @@ take_screenshot_full(image_format="webp", quality=30, include_ocr=false, include
 
 1. **Screenshot after every major action** — opening apps, switching windows, clicking buttons, submitting forms. Use Tier 1 screenshots (webp, quality=30, image only) — they're cheap (~67 KB).
 
-2. **Use `wait_for_text` / `wait_for_element` after launching apps** — don't assume the app opened. Wait for it with a timeout.
+2. **Always use `title_pattern` to target a specific window** — on screenshots, OCR, UI automation, and any tool that supports it. Capturing the full screen wastes tokens on irrelevant content (other windows, taskbar, desktop). Only use a full-screen capture when you don't know which window to target or need to find the app initially.
 
-3. **Activate the target window before keyboard input** — always call `activate_window(title_pattern="...")` before `type_text` or `press_keys` to ensure the right window is focused.
+3. **Use `wait_for_text` / `wait_for_element` after launching apps** — don't assume the app opened. Wait for it with a timeout.
 
-4. **Never chain more than 1-2 blind actions** — if you type + press Enter, take a screenshot to see what happened before doing more.
+4. **Activate the target window before keyboard input** — always call `activate_window(title_pattern="...")` before `type_text` or `press_keys` to ensure the right window is focused.
 
-5. **If something looks wrong, stop and re-assess** — don't keep sending inputs hoping it'll work. Take a screenshot, understand the current state, then decide.
+5. **Never chain more than 1-2 blind actions** — if you type + press Enter, take a screenshot to see what happened before doing more.
+
+6. **If something looks wrong, stop and re-assess** — don't keep sending inputs hoping it'll work. Take a screenshot, understand the current state, then decide.
 
 ### Actions that ALWAYS need verification
 
