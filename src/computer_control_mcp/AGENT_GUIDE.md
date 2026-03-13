@@ -123,6 +123,14 @@ A Tier 1 confirmation screenshot costs **~67 KB**. A failed blind action chain c
 | **Get text screen coordinates** | `get_text_bounds` | `element_ref`, `start`, `end` — screen rectangles for text |
 | **Set slider/range value** | `set_element_range_value` | `element_ref`, `value` |
 | **Move/resize window via UIA** | `move_element_ui`, `resize_element_ui`, `set_element_extents` | `element_ref` of a window frame |
+| **Read table/grid data** | `get_table_data` | `element_ref`, `start_row`, `max_rows` — returns headers + rows |
+| **Scroll a container** | `scroll_element_container` | `element_ref`, `direction`, `amount`, `unit` (page/line/percent) |
+| **Get scroll position** | `get_scroll_info` | `element_ref` — scroll percentages and scrollability |
+| **Switch element view** | `get_element_views` / `set_element_view` | Get available views, switch between them |
+| **Load virtualized item** | `realize_element` | `element_ref` — force-load item in virtual list |
+| **Get drag info** | `get_drag_info` | `element_ref` — check if draggable and drop effects |
+| **Get hyperlinks in text** | `get_hyperlinks` | `element_ref` — links with URIs and offsets (Linux) |
+| **Click a hyperlink** | `activate_hyperlink` | `element_ref`, `link_index` (Linux) |
 | Read text on screen | `take_screenshot_with_ocr` | `ocr_text_filter` for targeted search |
 | Find specific text (like grep) | `take_screenshot_with_ocr` | `ocr_text_filter="mem4\|mem 4"` |
 | Find text to click | `find_text` | `text="Submit\|OK"` with pipe-separated OR |
@@ -664,6 +672,69 @@ resize_element_ui(element_ref={...frame ref...}, width=800, height=600)
 
 # 4. Or do both at once
 set_element_extents(element_ref={...frame ref...}, x=200, y=200, width=900, height=700)
+```
+
+---
+
+## Table & Grid Reading
+
+Read structured data from tables, data grids, spreadsheets, and file lists.
+
+```
+# Find a table/grid element
+find_ui_elements(title_pattern="Explorer", role_filter="data grid|list|table")
+
+# Read the data (with paging)
+get_table_data(element_ref={...}, start_row=0, max_rows=50)
+# → {"row_count": 200, "column_count": 4, "headers": ["Name", "Date", "Type", "Size"],
+#    "rows": [[{"value": "file.txt"}, ...], ...], "has_more": true}
+
+# Read next page
+get_table_data(element_ref={...}, start_row=50, max_rows=50)
+```
+
+Common table/grid roles: `data grid`, `list`, `table`, `tree`
+
+## Programmatic Container Scrolling
+
+Scroll specific containers precisely — more reliable than mouse wheel which targets whatever is under the cursor.
+
+```
+# Find a scrollable container
+find_ui_elements(title_pattern="App", role_filter="list|pane|document")
+
+# Scroll by page
+scroll_element_container(element_ref={...}, direction="down", amount=1, unit="page")
+
+# Scroll by line (small increments)
+scroll_element_container(element_ref={...}, direction="down", amount=3, unit="line")
+
+# Scroll by percentage (absolute)
+scroll_element_container(element_ref={...}, direction="down", amount=25, unit="percent")
+
+# Check scroll position
+get_scroll_info(element_ref={...})
+# → {"vertical_percent": 25.0, "vertically_scrollable": true, ...}
+```
+
+**When to use `scroll_element_container` vs `scroll` (mouse wheel):**
+- Use `scroll_element_container` when you have a specific scrollable element ref and need precise control
+- Use `scroll` (mouse wheel) for general page scrolling or when you don't have an element ref
+
+## View Switching & Virtualization
+
+**Switch between views** (e.g., File Explorer list/details/icons):
+```
+get_element_views(element_ref={...})
+# → {"views": [{"id": 1, "name": "Details"}, {"id": 2, "name": "List"}, ...]}
+
+set_element_view(element_ref={...}, view_id=1)
+```
+
+**Realize virtualized items** — force-load items in large lists that only render visible rows:
+```
+realize_element(element_ref={...})
+# → Item is now fully created in the UI tree and can be interacted with
 ```
 
 ---

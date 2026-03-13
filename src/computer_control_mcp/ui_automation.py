@@ -2449,6 +2449,369 @@ def perform_text_action(element_ref: Dict[str, Any], action: str, **kwargs) -> D
     return result
 
 
+# ── Advanced Pattern Actions ───────────────────────────────────────────
+
+
+def _control_to_compact(ctrl) -> Dict[str, Any]:
+    """Convert a UIA control to a compact dict for JSON output."""
+    try:
+        name = ctrl.Name or ""
+        role = _UIA_ROLE_MAP.get(ctrl.ControlTypeName, ctrl.ControlTypeName or "unknown")
+        rect = ctrl.BoundingRectangle
+        result = {"name": name, "role": role}
+        if rect:
+            result["bounds"] = {"x": int(rect.left), "y": int(rect.top),
+                                "width": int(rect.width()), "height": int(rect.height())}
+        # Try to get text value
+        try:
+            vp = ctrl.GetValuePattern()
+            if vp and vp.Value is not None:
+                result["value"] = str(vp.Value)[:500]
+        except Exception:
+            pass
+        if not result.get("value"):
+            result["value"] = name
+        return result
+    except Exception:
+        return {"name": "", "role": "unknown"}
+
+
+def _perform_uia_advanced_action(control, action: str, **kwargs) -> Dict[str, Any]:
+    """Perform advanced UIA pattern operations (table, scroll, views, realize, drag)."""
+    try:
+        # ── Table / Grid ──
+        if action == "get_table_data":
+            gp = control.GetGridPattern()
+            if not gp:
+                return {"success": False, "error": "GridPattern not available on this element"}
+            row_count = gp.RowCount
+            col_count = gp.ColumnCount
+            start_row = kwargs.get("start_row", 0)
+            max_rows = kwargs.get("max_rows", 50)
+            end_row = min(start_row + max_rows, row_count)
+
+            # Try to get headers via TablePattern
+            headers = []
+            try:
+                tp = control.GetTablePattern()
+                if tp:
+                    col_headers = tp.GetColumnHeaders()
+                    if col_headers:
+                        headers = [_control_to_compact(h).get("value", "") for h in col_headers]
+            except Exception:
+                pass
+            # Fallback: use first row as headers if no TablePattern headers
+            if not headers and row_count > 0:
+                try:
+                    for c in range(col_count):
+                        cell = gp.GetItem(0, c)
+                        if cell:
+                            headers.append(_control_to_compact(cell).get("value", ""))
+                except Exception:
+                    pass
+
+            rows = []
+            for r in range(start_row, end_row):
+                row_data = []
+                for c in range(col_count):
+                    try:
+                        cell = gp.GetItem(r, c)
+                        row_data.append(_control_to_compact(cell) if cell else {"value": ""})
+                    except Exception:
+                        row_data.append({"value": ""})
+                rows.append(row_data)
+
+            return {"success": True, "row_count": row_count, "column_count": col_count,
+                    "headers": headers, "start_row": start_row, "returned_rows": len(rows),
+                    "has_more": end_row < row_count, "rows": rows}
+
+        # ── Scroll ──
+        if action == "scroll_container":
+            sp = control.GetScrollPattern()
+            if not sp:
+                return {"success": False, "error": "ScrollPattern not available on this element"}
+            import uiautomation as auto
+            SA = auto.ScrollAmount
+            direction = kwargs.get("direction", "down")
+            amount = kwargs.get("amount", 1)
+            unit = kwargs.get("unit", "page")
+
+            amount_map = {
+                "page": {"up": SA.LargeDecrement, "down": SA.LargeIncrement,
+                         "left": SA.LargeDecrement, "right": SA.LargeIncrement},
+                "line": {"up": SA.SmallDecrement, "down": SA.SmallIncrement,
+                         "left": SA.SmallDecrement, "right": SA.SmallIncrement},
+            }
+            if unit == "percent":
+                h_pct = sp.HorizontalScrollPercent
+                v_pct = sp.VerticalScrollPercent
+                if direction in ("up", "down"):
+                    delta = -amount if direction == "up" else amount
+                    new_v = max(0, min(100, v_pct + delta))
+                    sp.SetScrollPercent(h_pct if sp.HorizontallyScrollable else -1, new_v)
+                else:
+                    delta = -amount if direction == "left" else amount
+                    new_h = max(0, min(100, h_pct + delta))
+                    sp.SetScrollPercent(new_h, v_pct if sp.VerticallyScrollable else -1)
+                return {"success": True, "message": f"Scrolled {direction} by {amount}%"}
+
+            scroll_amt = amount_map.get(unit, amount_map["page"]).get(direction, SA.NoAmount)
+            for _ in range(amount):
+                if direction in ("up", "down"):
+                    sp.Scroll(SA.NoAmount, scroll_amt)
+                else:
+                    sp.Scroll(scroll_amt, SA.NoAmount)
+            return {"success": True, "message": f"Scrolled {direction} by {amount} {unit}(s)"}
+
+        if action == "get_scroll_info":
+            sp = control.GetScrollPattern()
+            if not sp:
+                return {"success": False, "error": "ScrollPattern not available on this element"}
+            return {
+                "success": True,
+                "horizontally_scrollable": bool(sp.HorizontallyScrollable),
+                "vertically_scrollable": bool(sp.VerticallyScrollable),
+                "horizontal_percent": sp.HorizontalScrollPercent,
+                "vertical_percent": sp.VerticalScrollPercent,
+                "horizontal_view_size": sp.HorizontalViewSize,
+                "vertical_view_size": sp.VerticalViewSize,
+            }
+
+        # ── Multiple View ──
+        if action == "get_views":
+            mvp = control.GetMultipleViewPattern()
+            if not mvp:
+                return {"success": False, "error": "MultipleViewPattern not available on this element"}
+            current = mvp.CurrentView
+            view_ids = mvp.GetSupportedViews() or []
+            views = []
+            for vid in view_ids:
+                try:
+                    name = mvp.GetViewName(vid)
+                    views.append({"id": vid, "name": name, "current": vid == current})
+                except Exception:
+                    views.append({"id": vid, "name": f"View {vid}", "current": vid == current})
+            return {"success": True, "current_view": current, "views": views}
+
+        if action == "set_view":
+            mvp = control.GetMultipleViewPattern()
+            if not mvp:
+                return {"success": False, "error": "MultipleViewPattern not available on this element"}
+            view_id = kwargs.get("view_id")
+            if view_id is None:
+                return {"success": False, "error": "view_id is required"}
+            mvp.SetView(int(view_id))
+            name = ""
+            try:
+                name = mvp.GetViewName(int(view_id))
+            except Exception:
+                pass
+            return {"success": True, "message": f"Switched to view {view_id}" + (f" ({name})" if name else "")}
+
+        # ── Virtualized Item ──
+        if action == "realize":
+            import uiautomation as auto
+            try:
+                vip = control.GetPattern(auto.PatternId.VirtualizedItemPattern)
+            except Exception:
+                vip = None
+            if not vip:
+                return {"success": False, "error": "VirtualizedItemPattern not available on this element"}
+            vip.Realize()
+            return {"success": True, "message": "Realized virtualized item"}
+
+        # ── Drag ──
+        if action == "get_drag_info":
+            import uiautomation as auto
+            try:
+                dp = control.GetPattern(auto.PatternId.DragPattern)
+            except Exception:
+                dp = None
+            if not dp:
+                return {"success": False, "error": "DragPattern not available on this element"}
+            return {
+                "success": True,
+                "is_grabbed": bool(dp.IsGrabbed),
+                "drop_effect": dp.DropEffect or "",
+                "drop_effects": list(dp.DropEffects or []),
+            }
+
+        return {"success": False, "error": f"Unsupported UIA advanced action: {action}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _perform_atspi_advanced_action(node, action: str, **kwargs) -> Dict[str, Any]:
+    """Perform advanced AT-SPI operations (table, scroll, hyperlinks)."""
+    try:
+        # ── Table ──
+        if action == "get_table_data":
+            ti = node.get_table_iface()
+            if not ti:
+                return {"success": False, "error": "Table interface not available on this element"}
+            row_count = ti.get_n_rows()
+            col_count = ti.get_n_columns()
+            start_row = kwargs.get("start_row", 0)
+            max_rows = kwargs.get("max_rows", 50)
+            end_row = min(start_row + max_rows, row_count)
+
+            headers = []
+            for c in range(col_count):
+                try:
+                    desc = ti.get_column_description(c) or ""
+                    if desc:
+                        headers.append(desc)
+                    else:
+                        hdr = ti.get_column_header(c)
+                        headers.append(hdr.get_name() if hdr else f"Col {c}")
+                except Exception:
+                    headers.append(f"Col {c}")
+
+            rows = []
+            for r in range(start_row, end_row):
+                row_data = []
+                for c in range(col_count):
+                    try:
+                        cell = ti.get_accessible_at(r, c)
+                        if cell:
+                            name = cell.get_name() or ""
+                            text_iface = cell.get_text_iface()
+                            value = ""
+                            if text_iface:
+                                value = text_iface.get_text(0, text_iface.get_character_count()) or ""
+                            row_data.append({"name": name, "value": value or name})
+                        else:
+                            row_data.append({"value": ""})
+                    except Exception:
+                        row_data.append({"value": ""})
+                rows.append(row_data)
+
+            return {"success": True, "row_count": row_count, "column_count": col_count,
+                    "headers": headers, "start_row": start_row, "returned_rows": len(rows),
+                    "has_more": end_row < row_count, "rows": rows}
+
+        # ── Scroll ──
+        if action == "scroll_container":
+            import gi
+            gi.require_version("Atspi", "2.0")
+            from gi.repository import Atspi as _Atspi
+            comp = node.get_component_iface()
+            if not comp:
+                return {"success": False, "error": "Component interface not available for scrolling"}
+            direction = kwargs.get("direction", "down")
+            scroll_map = {
+                "up": _Atspi.ScrollType.TOP_EDGE,
+                "down": _Atspi.ScrollType.BOTTOM_EDGE,
+                "left": _Atspi.ScrollType.LEFT_EDGE,
+                "right": _Atspi.ScrollType.RIGHT_EDGE,
+            }
+            scroll_type = scroll_map.get(direction, _Atspi.ScrollType.ANYWHERE)
+            ok = comp.scroll_to(scroll_type)
+            return {"success": bool(ok), "message": f"Scrolled {direction}"}
+
+        if action == "get_scroll_info":
+            # AT-SPI doesn't have a direct scroll info interface like UIA
+            # We can check if the element is scrollable by checking its states
+            import gi
+            gi.require_version("Atspi", "2.0")
+            from gi.repository import Atspi as _Atspi
+            try:
+                state_set = node.get_state_set()
+                return {
+                    "success": True,
+                    "horizontally_scrollable": state_set.contains(_Atspi.StateType.HORIZONTAL) if state_set else False,
+                    "vertically_scrollable": state_set.contains(_Atspi.StateType.VERTICAL) if state_set else False,
+                    "message": "AT-SPI does not provide scroll percentage info",
+                }
+            except Exception:
+                return {"success": True, "message": "Scroll info not available on AT-SPI"}
+
+        # ── Multiple View ──
+        if action in ("get_views", "set_view"):
+            return {"success": False, "error": "MultipleViewPattern not available on AT-SPI"}
+
+        # ── Virtualized Item ──
+        if action == "realize":
+            return {"success": False, "error": "VirtualizedItemPattern not available on AT-SPI"}
+
+        # ── Drag ──
+        if action == "get_drag_info":
+            return {"success": False, "error": "DragPattern not available on AT-SPI"}
+
+        # ── Hyperlinks ──
+        if action == "get_hyperlinks":
+            ht = node.get_hypertext_iface()
+            if not ht:
+                return {"success": False, "error": "Hypertext interface not available"}
+            n_links = ht.get_n_links()
+            links = []
+            for i in range(min(n_links, kwargs.get("max_links", 100))):
+                try:
+                    link = ht.get_link(i)
+                    if link:
+                        name = link.get_name() or ""
+                        uri = ""
+                        try:
+                            uri = link.get_uri(0) or ""
+                        except Exception:
+                            pass
+                        start = link.get_start_index()
+                        end = link.get_end_index()
+                        links.append({"index": i, "name": name, "uri": uri,
+                                      "start_offset": start, "end_offset": end})
+                except Exception:
+                    continue
+            return {"success": True, "link_count": n_links, "links": links}
+
+        if action == "activate_hyperlink":
+            ht = node.get_hypertext_iface()
+            if not ht:
+                return {"success": False, "error": "Hypertext interface not available"}
+            link_index = kwargs.get("link_index", 0)
+            link = ht.get_link(link_index)
+            if not link:
+                return {"success": False, "error": f"Hyperlink at index {link_index} not found"}
+            # Hyperlink extends Accessible, try action interface
+            ai = link.get_action_iface()
+            if ai and ai.get_n_actions() > 0:
+                ok = ai.do_action(0)
+                return {"success": bool(ok), "message": f"Activated hyperlink {link_index}"}
+            return {"success": False, "error": "Hyperlink has no activatable action"}
+
+        return {"success": False, "error": f"Unsupported AT-SPI advanced action: {action}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def perform_advanced_action(element_ref: Dict[str, Any], action: str, **kwargs) -> Dict[str, Any]:
+    """Cross-platform advanced action dispatcher.
+
+    Actions:
+        get_table_data      - Read table/grid data (start_row, max_rows)
+        scroll_container    - Scroll a container (direction, amount, unit)
+        get_scroll_info     - Get scroll position and scrollability
+        get_views           - Get available views (MultipleViewPattern)
+        set_view            - Switch to a view (view_id)
+        realize             - Realize a virtualized item
+        get_drag_info       - Get drag pattern info
+        get_hyperlinks      - Get hyperlinks in text (AT-SPI only)
+        activate_hyperlink  - Activate a hyperlink by index (AT-SPI only)
+    """
+    resolved = _resolve_ui_element(element_ref)
+    if not resolved.get("success"):
+        return {"success": False, "error": resolved.get("error")}
+
+    if resolved["backend"] == "uia":
+        result = _perform_uia_advanced_action(resolved["node"], action, **kwargs)
+    else:
+        result = _perform_atspi_advanced_action(resolved["node"], action, **kwargs)
+
+    result["backend"] = resolved["backend"]
+    result["action"] = action
+    result["ref"] = element_ref
+    return result
+
+
 # ── Public API ──────────────────────────────────────────────────────────
 
 

@@ -53,6 +53,7 @@ from computer_control_mcp.ui_automation import (
     get_ui_element_parent as _get_ui_element_parent_deep,
     perform_ui_action as _perform_ui_action_deep,
     perform_text_action as _perform_text_action_deep,
+    perform_advanced_action as _perform_advanced_action_deep,
 )
 
 BaseModel.model_config = {"arbitrary_types_allowed": True}
@@ -101,7 +102,7 @@ RELOAD_ENABLED = True  # Set to False to disable auto-reload
 mcp = FastMCP(
     "ComputerControlMCP",
     instructions=(
-        "Computer Control MCP provides 85+ tools for desktop automation: mouse, keyboard, "
+        "Computer Control MCP provides 90+ tools for desktop automation: mouse, keyboard, "
         "screenshots, OCR, deep UI automation, text manipulation, process management, and more. "
         "IMPORTANT: Before using any tools, call the 'get_agent_guide' tool first. It returns "
         "a file path to a comprehensive skill guide — read that file to learn best practices, "
@@ -4773,6 +4774,192 @@ def get_text_bounds(element_ref: Dict[str, Any], start: int, end: int) -> str:
 
 
 @mcp.tool()
+def get_table_data(
+    element_ref: Dict[str, Any],
+    start_row: int = 0,
+    max_rows: int = 50,
+) -> str:
+    """Read data from a table or grid element.
+
+    Returns headers, row count, column count, and cell data with paging support.
+    Works with data grids, spreadsheets, file lists, and any table-like control.
+
+    Args:
+        element_ref: Element ref of a table/grid from find_ui_elements.
+        start_row: First row to return (0-based). Default 0.
+        max_rows: Maximum rows to return. Default 50.
+
+    Returns:
+        JSON with headers, row_count, column_count, rows (array of cell arrays),
+        and has_more flag for paging.
+    """
+    try:
+        return json.dumps(_perform_advanced_action_deep(
+            element_ref, "get_table_data", start_row=start_row, max_rows=max_rows), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def scroll_element_container(
+    element_ref: Dict[str, Any],
+    direction: str = "down",
+    amount: int = 1,
+    unit: str = "page",
+) -> str:
+    """Programmatically scroll a scrollable container element.
+
+    More precise than mouse wheel scrolling — targets a specific scrollable
+    element by its ref rather than whatever is under the cursor.
+
+    Args:
+        element_ref: Element ref of a scrollable container.
+        direction: "up", "down", "left", or "right".
+        amount: Number of units to scroll (or percentage if unit="percent").
+        unit: "page" (large scroll), "line" (small scroll), or "percent" (absolute).
+
+    Returns:
+        JSON with success status.
+    """
+    try:
+        return json.dumps(_perform_advanced_action_deep(
+            element_ref, "scroll_container", direction=direction, amount=amount, unit=unit), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_scroll_info(element_ref: Dict[str, Any]) -> str:
+    """Get scroll position and scrollability info for a container element.
+
+    Args:
+        element_ref: Element ref of a scrollable container.
+
+    Returns:
+        JSON with horizontal/vertical scroll percentages, view sizes, and scrollability flags.
+    """
+    try:
+        return json.dumps(_perform_advanced_action_deep(element_ref, "get_scroll_info"), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_element_views(element_ref: Dict[str, Any]) -> str:
+    """Get available views for an element that supports multiple views.
+
+    Some controls (like File Explorer) support switching between views
+    (list, details, icons, tiles, etc.).
+
+    Args:
+        element_ref: Element ref from find_ui_elements.
+
+    Returns:
+        JSON with current_view and array of available views with IDs and names.
+    """
+    try:
+        return json.dumps(_perform_advanced_action_deep(element_ref, "get_views"), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def set_element_view(element_ref: Dict[str, Any], view_id: int) -> str:
+    """Switch an element to a different view.
+
+    Args:
+        element_ref: Element ref from find_ui_elements.
+        view_id: View ID from get_element_views.
+
+    Returns:
+        JSON with success status.
+    """
+    try:
+        return json.dumps(_perform_advanced_action_deep(
+            element_ref, "set_view", view_id=view_id), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def realize_element(element_ref: Dict[str, Any]) -> str:
+    """Realize a virtualized item — force-load an element that exists in a virtual list
+    but hasn't been loaded into memory yet.
+
+    Large lists (file explorers, data grids) often virtualize items, only creating
+    UI elements for visible rows. This tool forces the element to be fully created.
+
+    Args:
+        element_ref: Element ref of a virtualized item.
+
+    Returns:
+        JSON with success status.
+    """
+    try:
+        return json.dumps(_perform_advanced_action_deep(element_ref, "realize"), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_drag_info(element_ref: Dict[str, Any]) -> str:
+    """Get drag pattern info for an element — whether it's grabbed, and what drop effects are available.
+
+    Args:
+        element_ref: Element ref from find_ui_elements.
+
+    Returns:
+        JSON with is_grabbed, drop_effect, and drop_effects.
+    """
+    try:
+        return json.dumps(_perform_advanced_action_deep(element_ref, "get_drag_info"), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_hyperlinks(element_ref: Dict[str, Any], max_links: int = 100) -> str:
+    """Get hyperlinks embedded in a text element.
+
+    Returns all hyperlinks with their text, URI, and character offsets.
+    Primarily supported on Linux (AT-SPI Hypertext interface).
+
+    Args:
+        element_ref: Element ref of a text element containing hyperlinks.
+        max_links: Maximum number of links to return. Default 100.
+
+    Returns:
+        JSON with link_count and array of links with index, name, uri, start/end offsets.
+    """
+    try:
+        return json.dumps(_perform_advanced_action_deep(
+            element_ref, "get_hyperlinks", max_links=max_links), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def activate_hyperlink(element_ref: Dict[str, Any], link_index: int = 0) -> str:
+    """Activate (click) a hyperlink within a text element by its index.
+
+    Use get_hyperlinks first to discover available links and their indices.
+    Primarily supported on Linux (AT-SPI Hypertext interface).
+
+    Args:
+        element_ref: Element ref of a text element containing hyperlinks.
+        link_index: Index of the hyperlink to activate (from get_hyperlinks).
+
+    Returns:
+        JSON with success status.
+    """
+    try:
+        return json.dumps(_perform_advanced_action_deep(
+            element_ref, "activate_hyperlink", link_index=link_index), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
 def get_active_window() -> str:
     """Get the current foreground/active window."""
     try:
@@ -5561,7 +5748,7 @@ def get_agent_guide() -> str:
     if os.path.isfile(_AGENT_GUIDE_PATH):
         return json.dumps({
             "guide_path": _AGENT_GUIDE_PATH,
-            "message": "Read the file at guide_path to get the full agent skill guide. It contains best practices, tool selection, workflows, and troubleshooting for all 85 tools.",
+            "message": "Read the file at guide_path to get the full agent skill guide. It contains best practices, tool selection, workflows, and troubleshooting for all 94 tools.",
         })
     return json.dumps({"error": "Agent guide not found", "expected_path": _AGENT_GUIDE_PATH})
 

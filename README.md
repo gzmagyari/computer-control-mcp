@@ -61,6 +61,9 @@ This fork adds significant perception and automation capabilities for AI agents:
 - Deep UI automation with stable element refs, tree traversal, and semantic actions
 - Semantic element actions: toggle, select, invoke, focus, expand/collapse, set text, set range value, move/resize
 - Native text manipulation: select by offset or search, read selections, cursor positioning, word/line queries, text bounding rectangles
+- Table/grid data reading with headers and paging support
+- Programmatic container scrolling (page/line/percent) with scroll position queries
+- View switching, virtualized item realization, drag info, and hyperlink navigation
 - Window management (list, activate, wait for appear/disappear/active, fuzzy/regex matching)
 - Process management (list, kill) and system diagnostics (CPU, memory, disk, OS)
 - Filesystem watching (persistent watchers with event queues, one-shot file change waits)
@@ -169,6 +172,19 @@ This fork adds significant perception and automation capabilities for AI agents:
 | `resize_element_ui(element_ref, width, height)` | Resize an element (window) |
 | `set_element_extents(element_ref, x, y, width, height)` | Move + resize in one call |
 | `wait_for_focused_element(...)` | Wait until the focused element matches name/role filters |
+
+### Deep UI Automation — Tables, Scrolling & Advanced
+| Tool | Description |
+|------|-------------|
+| `get_table_data(element_ref, start_row, max_rows)` | Read data from tables/grids with headers and paging |
+| `scroll_element_container(element_ref, direction, amount, unit)` | Programmatically scroll a container (page/line/percent) |
+| `get_scroll_info(element_ref)` | Get scroll position and scrollability info |
+| `get_element_views(element_ref)` | Get available views (list/details/icons) |
+| `set_element_view(element_ref, view_id)` | Switch to a different view |
+| `realize_element(element_ref)` | Force-load a virtualized item in a large list |
+| `get_drag_info(element_ref)` | Get drag pattern info (is grabbed, drop effects) |
+| `get_hyperlinks(element_ref)` | Get hyperlinks in a text element with URIs and offsets |
+| `activate_hyperlink(element_ref, link_index)` | Activate a hyperlink by index |
 
 ### Process & System Management
 | Tool | Description |
