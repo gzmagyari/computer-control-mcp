@@ -52,6 +52,7 @@ from computer_control_mcp.ui_automation import (
     get_ui_element_children as _get_ui_element_children_deep,
     get_ui_element_parent as _get_ui_element_parent_deep,
     perform_ui_action as _perform_ui_action_deep,
+    perform_text_action as _perform_text_action_deep,
 )
 
 BaseModel.model_config = {"arbitrary_types_allowed": True}
@@ -4634,6 +4635,131 @@ def set_element_extents(element_ref: Dict[str, Any], x: int, y: int, width: int,
         width=width,
         height=height,
     )
+
+
+@mcp.tool()
+def get_text_selection(element_ref: Dict[str, Any]) -> str:
+    """Get the currently selected text within a text element.
+
+    Args:
+        element_ref: Element ref from find_ui_elements or similar discovery tool.
+
+    Returns:
+        JSON with selections array, each containing the selected text.
+    """
+    try:
+        return json.dumps(_perform_text_action_deep(element_ref, "get_selection"), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def select_text_range(element_ref: Dict[str, Any], start: int, end: int) -> str:
+    """Select text by character offset range within a text element.
+
+    Args:
+        element_ref: Element ref from find_ui_elements or similar discovery tool.
+        start: Start character offset (0-based, inclusive).
+        end: End character offset (0-based, exclusive).
+
+    Returns:
+        JSON with success status and the selected text.
+    """
+    try:
+        return json.dumps(_perform_text_action_deep(element_ref, "select_range", start=start, end=end), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def select_text_by_search(element_ref: Dict[str, Any], search_text: str) -> str:
+    """Find and select a substring within a text element.
+
+    Searches the element's text content for the given string and selects the first match.
+
+    Args:
+        element_ref: Element ref from find_ui_elements or similar discovery tool.
+        search_text: The text to find and select.
+
+    Returns:
+        JSON with success status, the matched text, and character offsets.
+    """
+    try:
+        return json.dumps(_perform_text_action_deep(element_ref, "select_by_search", search_text=search_text), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_text_caret_offset(element_ref: Dict[str, Any]) -> str:
+    """Get the cursor/caret position as a character offset within a text element.
+
+    Args:
+        element_ref: Element ref from find_ui_elements or similar discovery tool.
+
+    Returns:
+        JSON with the caret offset (0-based) and total text length.
+    """
+    try:
+        return json.dumps(_perform_text_action_deep(element_ref, "get_caret"), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def set_text_caret_offset(element_ref: Dict[str, Any], offset: int) -> str:
+    """Move the cursor/caret to a specific character offset within a text element.
+
+    Args:
+        element_ref: Element ref from find_ui_elements or similar discovery tool.
+        offset: Character offset to move the caret to (0-based).
+
+    Returns:
+        JSON with success status.
+    """
+    try:
+        return json.dumps(_perform_text_action_deep(element_ref, "set_caret", offset=offset), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_text_at_offset(element_ref: Dict[str, Any], offset: int, unit: str = "word") -> str:
+    """Get the word, line, or paragraph at a given character offset.
+
+    Args:
+        element_ref: Element ref from find_ui_elements or similar discovery tool.
+        offset: Character offset to query (0-based).
+        unit: Text unit — "char", "word", "line", "paragraph", or "sentence".
+
+    Returns:
+        JSON with the text content and its start/end offsets.
+    """
+    try:
+        return json.dumps(_perform_text_action_deep(element_ref, "get_text_at_offset", offset=offset, unit=unit), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_text_bounds(element_ref: Dict[str, Any], start: int, end: int) -> str:
+    """Get screen-space bounding rectangles for a text range.
+
+    Returns the on-screen positions of the specified text, useful for visual
+    highlighting or click targeting of specific text ranges.
+
+    Args:
+        element_ref: Element ref from find_ui_elements or similar discovery tool.
+        start: Start character offset (0-based, inclusive).
+        end: End character offset (0-based, exclusive).
+
+    Returns:
+        JSON with bounds array of {x, y, width, height} rectangles in screen coordinates.
+    """
+    try:
+        return json.dumps(_perform_text_action_deep(element_ref, "get_bounds", start=start, end=end), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()

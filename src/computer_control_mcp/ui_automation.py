@@ -2085,6 +2085,370 @@ def perform_ui_action(
     return result
 
 
+# ── Text Pattern Actions ───────────────────────────────────────────────
+
+_VALID_TEXT_UNITS = {"char", "word", "line", "paragraph", "sentence"}
+
+
+def _uia_get_text_pattern(control):
+    """Get TextPattern from a UIA control. Returns (pattern, error_dict)."""
+    try:
+        tp = control.GetTextPattern()
+        if tp and getattr(tp, "DocumentRange", None):
+            return tp, None
+    except Exception:
+        pass
+    return None, {"success": False, "error": "TextPattern not available on this element"}
+
+
+def _uia_position_range(text_pattern, start: int, end: int):
+    """Create a TextRange positioned at [start, end) character offsets."""
+    import uiautomation as auto
+    EP = auto.TextPatternRangeEndpoint
+    TU = auto.TextUnit
+    doc = text_pattern.DocumentRange.Clone()
+    # Collapse range to document start by moving End to Start
+    doc.MoveEndpointByRange(EP.End, doc, EP.Start)
+    # Move both endpoints by character count
+    if start > 0:
+        doc.MoveEndpointByUnit(EP.Start, TU.Character, start)
+    doc.MoveEndpointByUnit(EP.End, TU.Character, end)
+    return doc
+
+
+def _uia_text_unit(unit: str):
+    """Map logical unit name to UIA TextUnit constant."""
+    import uiautomation as auto
+    TU = auto.TextUnit
+    mapping = {
+        "char": TU.Character,
+        "word": TU.Word,
+        "line": TU.Line,
+        "paragraph": TU.Paragraph,
+        "sentence": TU.Paragraph,  # no sentence unit in UIA
+    }
+    return mapping.get(unit, TU.Character)
+
+
+def _perform_uia_text_action(control, action: str, **kwargs) -> Dict[str, Any]:
+    """Perform text pattern operations on a UIA control."""
+    tp, err = _uia_get_text_pattern(control)
+    if err:
+        return err
+
+    try:
+        if action == "get_selection":
+            try:
+                sel_array = tp.GetSelection()
+                selections = []
+                if sel_array:
+                    # Handle both list-like and COM array returns
+                    items = sel_array if isinstance(sel_array, (list, tuple)) else [sel_array]
+                    for r in items:
+                        try:
+                            txt = r.GetText(-1)
+                            selections.append({"text": txt or ""})
+                        except Exception:
+                            pass
+                return {"success": True, "selections": selections, "count": len(selections)}
+            except Exception as e:
+                return {"success": False, "error": f"GetSelection failed: {e}"}
+
+        if action == "select_range":
+            start, end = kwargs.get("start", 0), kwargs.get("end", 0)
+            if start < 0 or end < 0:
+                return {"success": False, "error": "start and end must be non-negative"}
+            if start > end:
+                return {"success": False, "error": "start must be <= end"}
+            rng = _uia_position_range(tp, start, end)
+            rng.Select()
+            selected = rng.GetText(-1)
+            return {"success": True, "message": f"Selected text range [{start}:{end}]",
+                    "start": start, "end": end, "text": selected or ""}
+
+        if action == "select_by_search":
+            search_text = kwargs.get("search_text", "")
+            if not search_text:
+                return {"success": False, "error": "search_text is required"}
+            try:
+                found = tp.DocumentRange.FindText(search_text, False, False)
+                if found:
+                    found.Select()
+                    selected = found.GetText(-1)
+                    return {"success": True, "message": f"Found and selected text",
+                            "text": selected or search_text}
+            except Exception:
+                pass
+            # Fallback: get full text, find offset, use range selection
+            full = tp.DocumentRange.GetText(-1) or ""
+            idx = full.find(search_text)
+            if idx < 0:
+                return {"success": False, "error": f"Text not found: '{search_text}'"}
+            rng = _uia_position_range(tp, idx, idx + len(search_text))
+            rng.Select()
+            return {"success": True, "message": "Found and selected text (fallback)",
+                    "text": search_text, "start": idx, "end": idx + len(search_text)}
+
+        if action == "get_caret":
+            import uiautomation as auto
+            EP = auto.TextPatternRangeEndpoint
+            # Try TextPattern2.GetCaretRange first
+            try:
+                tp2 = control.GetTextPattern2()
+                if tp2 and hasattr(tp2, "GetCaretRange"):
+                    is_active, caret_range = tp2.GetCaretRange()
+                    full = tp.DocumentRange.GetText(-1) or ""
+                    before_range = tp.DocumentRange.Clone()
+                    before_range.MoveEndpointByRange(EP.End, caret_range, EP.Start)
+                    before_text = before_range.GetText(-1) or ""
+                    return {"success": True, "offset": len(before_text), "text_length": len(full)}
+            except Exception:
+                pass
+            # Fallback: use selection as caret indicator
+            try:
+                sel = tp.GetSelection()
+                if sel:
+                    r = sel[0] if isinstance(sel, (list, tuple)) else sel
+                    full = tp.DocumentRange.GetText(-1) or ""
+                    before = tp.DocumentRange.Clone()
+                    before.MoveEndpointByRange(EP.End, r, EP.Start)
+                    before_text = before.GetText(-1) or ""
+                    return {"success": True, "offset": len(before_text), "text_length": len(full)}
+            except Exception:
+                pass
+            return {"success": False, "error": "Could not determine caret position"}
+
+        if action == "set_caret":
+            offset = kwargs.get("offset", 0)
+            if offset < 0:
+                return {"success": False, "error": "offset must be non-negative"}
+            rng = _uia_position_range(tp, offset, offset)
+            rng.Select()
+            return {"success": True, "offset": offset, "message": f"Caret moved to offset {offset}"}
+
+        if action == "get_text_at_offset":
+            offset = kwargs.get("offset", 0)
+            unit = kwargs.get("unit", "word")
+            if unit not in _VALID_TEXT_UNITS:
+                return {"success": False, "error": f"Invalid unit '{unit}'. Use: {', '.join(sorted(_VALID_TEXT_UNITS))}"}
+            rng = _uia_position_range(tp, offset, offset)
+            rng.ExpandToEnclosingUnit(_uia_text_unit(unit))
+            txt = rng.GetText(-1) or ""
+            return {"success": True, "text": txt, "unit": unit}
+
+        if action == "get_bounds":
+            start, end = kwargs.get("start", 0), kwargs.get("end", 0)
+            if start < 0 or end < 0 or start > end:
+                return {"success": False, "error": "Invalid start/end range"}
+            rng = _uia_position_range(tp, start, end)
+            try:
+                raw = rng.GetBoundingRectangles()
+                rects = []
+                if raw:
+                    for item in raw:
+                        try:
+                            # uiautomation returns Rect objects with .left/.top/.right/.bottom
+                            if hasattr(item, "left"):
+                                rects.append({
+                                    "x": int(item.left), "y": int(item.top),
+                                    "width": int(item.right - item.left),
+                                    "height": int(item.bottom - item.top),
+                                })
+                            elif isinstance(item, (list, tuple)) and len(item) >= 4:
+                                rects.append({
+                                    "x": int(item[0]), "y": int(item[1]),
+                                    "width": int(item[2]), "height": int(item[3]),
+                                })
+                        except Exception:
+                            pass
+                return {"success": True, "bounds": rects, "start": start, "end": end,
+                        "rect_count": len(rects)}
+            except Exception as e:
+                return {"success": False, "error": f"GetBoundingRectangles failed: {e}"}
+
+        return {"success": False, "error": f"Unsupported UIA text action: {action}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
+    """Perform text pattern operations on an AT-SPI node."""
+    try:
+        ti = node.get_text_iface()
+        if not ti:
+            return {"success": False, "error": "Text interface not available on this element"}
+    except Exception:
+        return {"success": False, "error": "Text interface not available on this element"}
+
+    try:
+        char_count = ti.get_character_count()
+
+        if action == "get_selection":
+            n_sel = ti.get_n_selections()
+            selections = []
+            for i in range(n_sel):
+                r = ti.get_selection(i)
+                if r:
+                    s, e = r.start_offset, r.end_offset
+                    txt = ti.get_text(s, e)
+                    selections.append({"start": s, "end": e, "text": txt or ""})
+            return {"success": True, "selections": selections, "count": len(selections)}
+
+        if action == "select_range":
+            start, end = kwargs.get("start", 0), kwargs.get("end", 0)
+            if start < 0 or end < 0:
+                return {"success": False, "error": "start and end must be non-negative"}
+            if start > end:
+                return {"success": False, "error": "start must be <= end"}
+            end = min(end, char_count)
+            # Remove existing selections
+            for i in range(ti.get_n_selections() - 1, -1, -1):
+                try:
+                    ti.remove_selection(i)
+                except Exception:
+                    pass
+            ok = ti.add_selection(start, end)
+            txt = ti.get_text(start, end) if ok else ""
+            return {"success": bool(ok), "message": f"Selected text range [{start}:{end}]",
+                    "start": start, "end": end, "text": txt or ""}
+
+        if action == "select_by_search":
+            search_text = kwargs.get("search_text", "")
+            if not search_text:
+                return {"success": False, "error": "search_text is required"}
+            full = ti.get_text(0, char_count) or ""
+            idx = full.find(search_text)
+            if idx < 0:
+                return {"success": False, "error": f"Text not found: '{search_text}'"}
+            # Remove existing selections
+            for i in range(ti.get_n_selections() - 1, -1, -1):
+                try:
+                    ti.remove_selection(i)
+                except Exception:
+                    pass
+            ok = ti.add_selection(idx, idx + len(search_text))
+            return {"success": bool(ok), "message": "Found and selected text",
+                    "text": search_text, "start": idx, "end": idx + len(search_text)}
+
+        if action == "get_caret":
+            offset = ti.get_caret_offset()
+            return {"success": True, "offset": offset, "text_length": char_count}
+
+        if action == "set_caret":
+            offset = kwargs.get("offset", 0)
+            if offset < 0:
+                return {"success": False, "error": "offset must be non-negative"}
+            ok = ti.set_caret_offset(min(offset, char_count))
+            return {"success": bool(ok), "offset": offset,
+                    "message": f"Caret moved to offset {offset}"}
+
+        if action == "get_text_at_offset":
+            offset = kwargs.get("offset", 0)
+            unit = kwargs.get("unit", "word")
+            if unit not in _VALID_TEXT_UNITS:
+                return {"success": False, "error": f"Invalid unit '{unit}'. Use: {', '.join(sorted(_VALID_TEXT_UNITS))}"}
+            import gi
+            gi.require_version("Atspi", "2.0")
+            from gi.repository import Atspi as _Atspi
+            granularity_map = {
+                "char": _Atspi.TextGranularity.CHAR,
+                "word": _Atspi.TextGranularity.WORD,
+                "line": _Atspi.TextGranularity.LINE,
+                "paragraph": _Atspi.TextGranularity.PARAGRAPH,
+                "sentence": _Atspi.TextGranularity.SENTENCE,
+            }
+            try:
+                result = ti.get_string_at_offset(offset, granularity_map[unit])
+                return {"success": True, "text": result.content or "",
+                        "start": result.start_offset, "end": result.end_offset, "unit": unit}
+            except Exception:
+                # Fallback to deprecated get_text_at_offset
+                boundary_map = {
+                    "char": _Atspi.TextBoundaryType.CHAR,
+                    "word": _Atspi.TextBoundaryType.WORD_START,
+                    "line": _Atspi.TextBoundaryType.LINE_START,
+                    "paragraph": _Atspi.TextBoundaryType.LINE_START,
+                    "sentence": _Atspi.TextBoundaryType.SENTENCE_START,
+                }
+                result = ti.get_text_at_offset(offset, boundary_map[unit])
+                return {"success": True, "text": result.content or "",
+                        "start": result.start_offset, "end": result.end_offset, "unit": unit}
+
+        if action == "get_bounds":
+            start, end = kwargs.get("start", 0), kwargs.get("end", 0)
+            if start < 0 or end < 0 or start > end:
+                return {"success": False, "error": "Invalid start/end range"}
+            end = min(end, char_count)
+            import gi
+            gi.require_version("Atspi", "2.0")
+            from gi.repository import Atspi as _Atspi
+            # Try get_range_extents first (single bounding box for entire range)
+            try:
+                rect = ti.get_range_extents(start, end, _Atspi.CoordType.SCREEN)
+                if rect and rect.width > 0 and rect.height > 0:
+                    return {"success": True, "bounds": [{
+                        "x": rect.x, "y": rect.y,
+                        "width": rect.width, "height": rect.height,
+                    }], "start": start, "end": end, "rect_count": 1}
+            except Exception:
+                pass
+            # Fallback: per-character extents, merge by line
+            rects = []
+            current_line = None
+            for i in range(start, min(end, start + 500)):  # cap to avoid huge loops
+                try:
+                    ext = ti.get_character_extents(i, _Atspi.CoordType.SCREEN)
+                    if ext.width <= 0 and ext.height <= 0:
+                        continue
+                    # Merge rects on same line (similar y position)
+                    if current_line and abs(ext.y - current_line["y"]) < ext.height * 0.5:
+                        current_line["width"] = (ext.x + ext.width) - current_line["x"]
+                    else:
+                        if current_line:
+                            rects.append(current_line)
+                        current_line = {"x": ext.x, "y": ext.y,
+                                        "width": ext.width, "height": ext.height}
+                except Exception:
+                    continue
+            if current_line:
+                rects.append(current_line)
+            return {"success": True, "bounds": rects, "start": start, "end": end,
+                    "rect_count": len(rects)}
+
+        return {"success": False, "error": f"Unsupported AT-SPI text action: {action}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def perform_text_action(element_ref: Dict[str, Any], action: str, **kwargs) -> Dict[str, Any]:
+    """Cross-platform text pattern action dispatcher.
+
+    Resolves the element ref, then dispatches to the appropriate platform handler.
+
+    Actions:
+        get_selection - Get currently selected text
+        select_range  - Select text by character offsets (start, end)
+        select_by_search - Find and select a substring (search_text)
+        get_caret     - Get caret/cursor offset within text
+        set_caret     - Move caret to offset (offset)
+        get_text_at_offset - Get word/line/paragraph at offset (offset, unit)
+        get_bounds    - Get screen rectangles for text range (start, end)
+    """
+    resolved = _resolve_ui_element(element_ref)
+    if not resolved.get("success"):
+        return {"success": False, "error": resolved.get("error")}
+
+    if resolved["backend"] == "uia":
+        result = _perform_uia_text_action(resolved["node"], action, **kwargs)
+    else:
+        result = _perform_atspi_text_action(resolved["node"], action, **kwargs)
+
+    result["backend"] = resolved["backend"]
+    result["action"] = action
+    result["ref"] = element_ref
+    return result
+
+
 # ── Public API ──────────────────────────────────────────────────────────
 
 
