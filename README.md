@@ -39,7 +39,7 @@ computer-control-mcp-enhanced
 This fork adds significant perception and automation capabilities for AI agents:
 
 - **UI Automation** — Full Windows UI Automation (UIA) and Linux AT-SPI tree traversal with occlusion filtering, exposing interactive elements (buttons, text fields, menus) with absolute screen coordinates
-- **Deep UI Automation** — Discover elements with stable refs, traverse the element tree (parent/child navigation), and perform semantic actions (toggle, select, invoke, set text/range values, expand/collapse, move/resize) — no coordinate math needed
+- **Deep UI Automation** — Discover elements with stable refs, traverse the element tree (parent/child navigation), and perform semantic actions (toggle, select, invoke, set text/range values, expand/collapse, move/resize) plus native text manipulation (select by search/offset, cursor positioning, word/line queries, text bounding rectangles) — no coordinate math needed
 - **Combined perception** (`take_screenshot_full`) — Image + OCR + UI automation in a single call with parallel execution, selectable via `include_image`/`include_ocr`/`include_ui` flags
 - **Region capture** — All screenshot/OCR/UI tools accept a `region=[x, y, w, h]` parameter to capture arbitrary screen rectangles instead of full screen or full window
 - **Coordinate verification** (`capture_region_around`) — Capture a small area around target coordinates with an optional red circle marker for visual verification before clicking
@@ -60,6 +60,7 @@ This fork adds significant perception and automation capabilities for AI agents:
 - UI automation element detection (buttons, fields, menus, etc.)
 - Deep UI automation with stable element refs, tree traversal, and semantic actions
 - Semantic element actions: toggle, select, invoke, focus, expand/collapse, set text, set range value, move/resize
+- Native text manipulation: select by offset or search, read selections, cursor positioning, word/line queries, text bounding rectangles
 - Window management (list, activate, wait for appear/disappear/active, fuzzy/regex matching)
 - Process management (list, kill) and system diagnostics (CPU, memory, disk, OS)
 - Filesystem watching (persistent watchers with event queues, one-shot file change waits)
@@ -155,6 +156,13 @@ This fork adds significant perception and automation capabilities for AI agents:
 | `collapse_element(element_ref)` | Collapse a tree node or combo box |
 | `set_element_text(element_ref, text)` | Set text value of an input field |
 | `get_element_text(element_ref)` | Read text value from an element |
+| `select_text_range(element_ref, start, end)` | Select text by character offset range |
+| `select_text_by_search(element_ref, search_text)` | Find and select a substring in a text element |
+| `get_text_selection(element_ref)` | Read the currently selected text |
+| `get_text_caret_offset(element_ref)` | Get cursor/caret position as character offset |
+| `set_text_caret_offset(element_ref, offset)` | Move cursor to a specific character offset |
+| `get_text_at_offset(element_ref, offset, unit)` | Get word, line, or paragraph at an offset |
+| `get_text_bounds(element_ref, start, end)` | Get screen-space bounding rectangles for a text range |
 | `scroll_element_into_view(element_ref)` | Scroll an element into the visible area |
 | `set_element_range_value(element_ref, value)` | Set numeric value on a slider or range control |
 | `move_element_ui(element_ref, x, y)` | Move an element (window) to a position |
@@ -273,6 +281,29 @@ select_element(element_ref={...})
 
 # Move/resize a window via UI automation
 set_element_extents(element_ref={...}, x=100, y=100, width=800, height=600)
+```
+
+**Text Manipulation:** Select, navigate, and query text within document/edit elements — no keyboard simulation needed.
+
+```python
+# Find and select a substring
+select_text_by_search(element_ref={...}, search_text="brown fox")
+
+# Select by character offsets
+select_text_range(element_ref={...}, start=4, end=19)
+
+# Read what's currently selected
+get_text_selection(element_ref={...})  # → {"selections": [{"text": "brown fox"}]}
+
+# Get/set cursor position
+get_text_caret_offset(element_ref={...})  # → {"offset": 10}
+set_text_caret_offset(element_ref={...}, offset=50)
+
+# Get word or line at a position
+get_text_at_offset(element_ref={...}, offset=4, unit="word")  # → {"text": "quick "}
+
+# Get screen coordinates for a text range
+get_text_bounds(element_ref={...}, start=4, end=19)  # → bounding rectangles
 ```
 
 Element refs survive minor UI changes (scrolling, focus shifts) but need re-discovery if the window title changes or the element tree restructures.

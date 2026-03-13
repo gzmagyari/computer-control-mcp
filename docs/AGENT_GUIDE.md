@@ -114,6 +114,13 @@ A Tier 1 confirmation screenshot costs **~67 KB**. A failed blind action chain c
 | **Perform semantic action** | `invoke_element`, `toggle_element`, `select_element`, etc. | `element_ref` — no coordinates needed |
 | **Set text via automation** | `set_element_text` | `element_ref`, `text` — uses ValuePattern |
 | **Read text via automation** | `get_element_text` | `element_ref` — reads from ValuePattern/TextPattern |
+| **Select text by offsets** | `select_text_range` | `element_ref`, `start`, `end` — character offsets |
+| **Find & select text** | `select_text_by_search` | `element_ref`, `search_text` — finds and highlights |
+| **Read selected text** | `get_text_selection` | `element_ref` — returns currently selected text |
+| **Get cursor position in text** | `get_text_caret_offset` | `element_ref` — returns character offset |
+| **Move cursor in text** | `set_text_caret_offset` | `element_ref`, `offset` — moves caret |
+| **Get word/line at position** | `get_text_at_offset` | `element_ref`, `offset`, `unit` (char/word/line/paragraph) |
+| **Get text screen coordinates** | `get_text_bounds` | `element_ref`, `start`, `end` — screen rectangles for text |
 | **Set slider/range value** | `set_element_range_value` | `element_ref`, `value` |
 | **Move/resize window via UIA** | `move_element_ui`, `resize_element_ui`, `set_element_extents` | `element_ref` of a window frame |
 | Read text on screen | `take_screenshot_with_ocr` | `ocr_text_filter` for targeted search |
@@ -497,8 +504,15 @@ These actions operate on element refs — no coordinate math needed.
 | `select_element` | Select (list items, tabs, radio buttons) | SelectionItemPattern |
 | `expand_element` | Expand (tree nodes, combo boxes, menus) | ExpandCollapsePattern |
 | `collapse_element` | Collapse (tree nodes, combo boxes) | ExpandCollapsePattern |
-| `set_element_text` | Set text value (input fields) | ValuePattern |
-| `get_element_text` | Read text value | ValuePattern / TextPattern |
+| `set_element_text` | Set entire text value (input fields) | ValuePattern |
+| `get_element_text` | Read entire text value | ValuePattern / TextPattern |
+| `select_text_range` | Select text by character offsets | TextPattern |
+| `select_text_by_search` | Find and select a substring | TextPattern |
+| `get_text_selection` | Read the currently selected text | TextPattern |
+| `get_text_caret_offset` | Get cursor position as character offset | TextPattern |
+| `set_text_caret_offset` | Move cursor to a character offset | TextPattern |
+| `get_text_at_offset` | Get word/line/paragraph at an offset | TextPattern |
+| `get_text_bounds` | Get screen rectangles for a text range | TextPattern |
 | `scroll_element_into_view` | Scroll element into visible area | ScrollItemPattern |
 | `set_element_range_value` | Set numeric value (sliders, progress bars) | RangeValuePattern |
 | `move_element_ui` | Move element to position (windows) | TransformPattern |
@@ -512,7 +526,7 @@ These actions operate on element refs — no coordinate math needed.
 | Role | What it is | Common actions |
 |------|-----------|---------------|
 | `push button` | Clickable button | invoke |
-| `document` / `edit` | Text input area | set_text, get_text, focus |
+| `document` / `edit` | Text input area | set_text, get_text, focus, select_text_range, select_text_by_search, get_text_caret_offset, get_text_bounds |
 | `combo box` | Dropdown / select | expand, collapse |
 | `list item` | Item in a list | select, invoke |
 | `page tab` / `tab item` | Tab in a tab bar | select |
@@ -561,6 +575,75 @@ set_element_text(element_ref={...ref...}, text="Hello World")
 # 3. Read back to verify
 get_element_text(element_ref={...ref...})
 # → "Hello World"
+```
+
+### Text Manipulation Tools (TextPattern)
+
+These tools operate on text elements (`document`, `edit`) that support the UIA TextPattern or AT-SPI Text interface. They enable **native programmatic text selection, cursor positioning, and text querying** — more reliable than keyboard simulation.
+
+#### When to Use Text Tools vs Keyboard Shortcuts
+
+| Scenario | Use | Why |
+|----------|-----|-----|
+| Select a specific substring | `select_text_by_search` | Precise, finds text regardless of cursor position |
+| Select text by offset range | `select_text_range` | Exact character-level control |
+| Copy specific text to clipboard | `select_text_by_search` → `press_keys([["ctrl","c"]])` | Select natively, copy with keyboard |
+| Move cursor to a known position | `set_text_caret_offset` | Instant, no repeated arrow key presses |
+| Check what's selected | `get_text_selection` | Reads selection directly from the control |
+| Get the word/line at a position | `get_text_at_offset` | No need to select + copy + parse |
+| Find screen position of text | `get_text_bounds` | Exact pixel rectangles, useful for click targeting |
+| Select all text | `press_keys([["ctrl","a"]])` | Simpler than `select_text_range(0, length)` |
+| Type new text into a field | `set_element_text` or `type_text` | Text tools don't type — they select/navigate |
+
+#### Text Units for `get_text_at_offset`
+
+| Unit | What it returns | Example |
+|------|----------------|---------|
+| `"char"` | Single character | `"q"` |
+| `"word"` | Word + trailing whitespace | `"quick "` |
+| `"line"` | Full line including line break | `"The quick brown fox jumps over the lazy dog.\r"` |
+| `"paragraph"` | Full paragraph | Same as line for single-line paragraphs |
+
+### Deep UI Workflow Example — Select, Copy, and Paste Text
+
+```
+# 1. Find the text element in the source app
+find_ui_elements(title_pattern="Notepad", role_filter="document", limit=5)
+
+# 2. Find and select a specific substring
+select_text_by_search(element_ref={...ref...}, search_text="brown fox")
+# → Highlights "brown fox" in the document
+
+# 3. Copy to clipboard
+press_keys([["ctrl", "c"]])
+
+# 4. Switch to target app and paste
+activate_window(title_pattern="Other App")
+press_keys([["ctrl", "v"]])
+# → "brown fox" pasted into the other app
+```
+
+### Deep UI Workflow Example — Navigate and Inspect Text
+
+```
+# 1. Get current cursor position
+get_text_caret_offset(element_ref={...ref...})
+# → {"offset": 10, "text_length": 115}
+
+# 2. Get the word at that position
+get_text_at_offset(element_ref={...ref...}, offset=10, unit="word")
+# → {"text": "brown ", "unit": "word"}
+
+# 3. Get the full line
+get_text_at_offset(element_ref={...ref...}, offset=10, unit="line")
+# → {"text": "The quick brown fox jumps over the lazy dog.\r", "unit": "line"}
+
+# 4. Move cursor to a different position
+set_text_caret_offset(element_ref={...ref...}, offset=50)
+
+# 5. Get screen coordinates of a text range (for click targeting)
+get_text_bounds(element_ref={...ref...}, start=4, end=19)
+# → {"bounds": [{"x": 979, "y": 266, "width": 152, "height": 34}]}
 ```
 
 ### Deep UI Workflow Example — Move/Resize a Window
@@ -1044,3 +1127,6 @@ the universal fallback for any coordinate-based interaction.
 | `launch_app` PID doesn't match `list_processes` | Parent process exited, child has different PID | Use `list_processes` to find actual PID, or `kill_process(process_name=...)` |
 | File watch returns "watchdog not installed" | `watchdog` library missing from Python environment | Install: `pip install watchdog` and restart MCP server |
 | `wait_for_file_change` times out | Change happened before watcher initialized, or path wrong | Use persistent `start_file_watch` instead; verify path exists with correct format |
+| `select_text_range` / `select_text_by_search` fails | Element doesn't support TextPattern | Only `document` and `edit` roles typically support TextPattern; fall back to `click_screen` + Shift+click for selection |
+| `get_text_bounds` returns empty bounds | Window not active or control doesn't implement GetBoundingRectangles | Activate the window first with `activate_window`; some controls may not support bounds |
+| `get_text_caret_offset` fails | TextPattern2 not available and no selection exists | Click into the text field first to establish a caret position |
