@@ -42,7 +42,7 @@ This fork adds significant perception and automation capabilities for AI agents:
 - **Deep UI Automation** — Discover elements with stable refs, traverse the element tree (parent/child navigation), and perform semantic actions (toggle, select, invoke, set text/range values, expand/collapse, move/resize) plus native text manipulation (select by search/offset, cursor positioning, word/line queries, text bounding rectangles) — no coordinate math needed
 - **Combined perception** (`take_screenshot_full`) — Image + OCR + UI automation in a single call with parallel execution, selectable via `include_image`/`include_ocr`/`include_ui` flags
 - **Region capture** — All screenshot/OCR/UI tools accept a `region=[x, y, w, h]` parameter to capture arbitrary screen rectangles instead of full screen or full window
-- **Coordinate verification** (`capture_region_around`) — Capture a small area around target coordinates with an optional red circle marker for visual verification before clicking
+- **Coordinate verification** (`capture_region_around`) — Capture a small area around target coordinates with coordinate rulers showing real screen positions on edges, plus optional red circle marker. Agents read coordinates directly from rulers — no scale factor math needed, typically 1-2 steps instead of 5-6
 - **Wait & polling tools** — `wait_for_window` (appear/disappear/active), `wait_for_focused_element`, `wait_for_screen_change` — synchronize with application state instead of blind delays
 - **Filesystem watching** — Persistent directory watchers with event queues, or one-shot waits for file changes. Monitor builds, downloads, or any filesystem activity
 - **Process & system management** — `kill_process`, `list_processes`, `get_system_info` — full process lifecycle and system diagnostics
@@ -69,7 +69,7 @@ This fork adds significant perception and automation capabilities for AI agents:
 - Filesystem watching (persistent watchers with event queues, one-shot file change waits)
 - Screen change detection (pixel, OCR, and UI automation diffs)
 - Accessibility-aware app launching for better UI element exposure
-- Coordinate verification with visual markers for precise clicking
+- Coordinate verification with ruler overlays and visual markers for precise clicking
 - Image optimization (format, quality, color mode, prescaling)
 - GPU-accelerated window capture via WGC (Windows only)
 - Clipboard operations
@@ -233,13 +233,25 @@ This lets an agent start with a full-screen capture, identify the area of intere
 
 ## Coordinate Verification Workflow
 
-AI agents often misjudge coordinates from screenshots. The `capture_region_around` tool enables a verification loop:
+AI agents often misjudge coordinates from prescaled screenshots. The `capture_region_around` tool solves this with **coordinate rulers** — real screen coordinates drawn directly on the image edges:
 
-1. Agent takes a full screenshot and estimates target coordinates
-2. Calls `capture_region_around(x=500, y=300, mark_center=True)` to see a zoomed-in view with a red circle marker
-3. Analyzes the small image to check if the marker is on the right element
-4. Adjusts coordinates if needed and repeats
-5. Once verified, clicks the confirmed coordinates
+```python
+# Capture a region with coordinate rulers (enabled by default)
+capture_region_around(x=935, y=630, radius=80, ruler_tick_interval=25)
+# → Zoomed-in view with X coordinates on top edge, Y coordinates on left edge
+# → Agent reads target's exact position from the rulers — no math needed
+# → Click the coordinates directly
+```
+
+**How it works:**
+1. Agent takes a full screenshot and roughly estimates the target area
+2. Calls `capture_region_around` — rulers on edges show real screen coordinates
+3. Agent reads the target's exact coordinates from the ruler grid lines
+4. Clicks — typically accurate on the first attempt
+
+Optional: add `mark_center=True` to also draw a red circle marker at the estimated position for visual confirmation before clicking.
+
+This replaces the old multi-iteration guessing loop with a **1-2 step** process.
 
 ## Accessibility-Aware App Launching
 

@@ -1039,7 +1039,7 @@ take_screenshot_full(image_format="webp", quality=30, include_ocr=false, include
 
 ---
 
-### Coordinate Refinement Loop (vision-based interaction)
+### Coordinate Refinement with Rulers (vision-based interaction)
 
 **When to use:** When UI automation doesn't expose the element you need to interact with.
 This works for any coordinate-based action — clicking links, locating input fields to type into,
@@ -1047,48 +1047,39 @@ finding drag start/end points, targeting scroll areas, or positioning for right-
 This is your universal fallback for arbitrary coordinate-based interaction using only vision.
 
 **How it works:**
-1. Take an image-only screenshot to see the target
-2. Estimate coordinates by multiplying image position × `scale_factor` + window offset
-3. Use `capture_region_around` with `mark_center=true` to verify — it draws a red circle
-   at your estimated coordinates on a zoomed-in view
-4. If the marker is off, adjust and repeat
-5. Once the marker is on the target, click
+1. Take an image-only screenshot to see the target and roughly estimate its area
+2. Use `capture_region_around` with `show_rulers=true` (default) — coordinate rulers on the
+   edges show **real screen coordinates** directly on the image
+3. Read the target's coordinates from the rulers — no scale factor math needed
+4. Click the coordinates
+
+This is typically a **2-step process**: one capture to read coordinates, one click.
 
 **Step by step:**
 ```
-# Step 1: Image-only screenshot to see the target
+# Step 1: Image-only screenshot to see the target and roughly estimate its area
 take_screenshot_full(
     title_pattern="Edge",
     image_format="webp", quality=50,
     include_ocr=false, include_ui=false
 )
-# Note the scale_factor from the response (e.g. 1.88)
+# Roughly estimate the area where the target is (doesn't need to be exact)
 
-# Step 2: Estimate coordinates
-# Visual position in image: (x_img, y_img)
-# Real coords ≈ window_left + (x_img × scale_factor), window_top + (y_img × scale_factor)
-
-# Step 3: Verify with marker
+# Step 2: Capture region with coordinate rulers
 capture_region_around(
-    x=<estimated_x>, y=<estimated_y>,
-    radius=100,          # 200x200px capture area
-    mark_center=true,    # draw red circle at target
-    image_format="webp", quality=50
+    x=<rough_estimate_x>, y=<rough_estimate_y>,
+    radius=80,                # 160x160px area — wide enough to see the target
+    show_rulers=true,         # coordinate rulers on edges (default)
+    ruler_tick_interval=25,   # dense ticks for precision (every 25px)
+    image_format="webp", quality=70
 )
-# → See zoomed-in view with red circle marker
+# → See zoomed-in view with coordinate rulers on top and left edges
+# → Read the target's exact coordinates directly from the rulers
 
-# Step 4: Adjust if marker is off-target
-# - Marker too far left? Increase x
-# - Marker too high? Increase y
-# Repeat capture_region_around with adjusted coordinates
+# Step 3: Click the coordinates read from the rulers
+click_screen(x=<x_from_ruler>, y=<y_from_ruler>)
 
-# Step 5: Once marker is on target, perform your action
-click_screen(x=<verified_x>, y=<verified_y>)       # click a button/link
-# OR: click_screen(...) then type_text("query")     # fill an input field
-# OR: drag_mouse(from_x, from_y, to_x, to_y)       # drag from verified point
-# OR: scroll(x=<verified_x>, y=<verified_y>)        # scroll a specific panel
-
-# Step 6: Confirm with Tier 1 screenshot
+# Step 4: Confirm with Tier 1 screenshot
 take_screenshot_full(
     title_pattern="Edge",
     image_format="webp", quality=30,
@@ -1096,27 +1087,53 @@ take_screenshot_full(
 )
 ```
 
-**Tips for faster convergence:**
-- Start with `radius=100` (200x200 area) for a wider view, shrink to `radius=60` once you're close
-- Each iteration is tiny (~5-15 KB for a small webp region) — cheap to do multiple rounds
-- Common adjustments: if marker is off by a lot, shift 50-100px; if close, shift 10-20px
-- The zoomed-in view has `scale_factor: 1.0` (no prescaling) so you see pixel-perfect detail
-- For text links, aim for the horizontal center of the text and vertical middle of the line
+**Reading coordinates from rulers:**
+- The top ruler shows real screen X coordinates (e.g., 900, 925, 950, 975...)
+- The left ruler shows real screen Y coordinates (e.g., 575, 600, 625, 650...)
+- Light grid lines extend into the image at each tick mark
+- Find where your target sits relative to the grid lines and read off the coordinates
+- Example: if a button sits halfway between the 925 and 950 X ticks, and right on the 625 Y tick, its coordinates are approximately (937, 625)
 
-**Real example — clicking a "Wikipedia" link not exposed by UI automation:**
+**Tips for best results:**
+- Use `ruler_tick_interval=25` for small targets (icons, checkboxes) — gives 25px precision
+- Use `ruler_tick_interval=50` (default) for larger targets (buttons, links)
+- Use `radius=60-80` for small areas, `radius=120-150` for larger regions
+- If the target isn't in the captured area, adjust the center and try again
+- Combine with `mark_center=true` if you want to verify a specific coordinate before clicking
+
+**Real example — clicking a tiny star/favorite icon on a web app:**
 ```
-Attempt 1: (1369, 386) → marker in news section, way off
-Attempt 2: (1450, 225) → search bar area, wrong section
-Attempt 3: (1530, 320) → About section visible, Wikipedia in corner
-Attempt 4: (1575, 390) → almost, just above Wikipedia text
-Attempt 5: (1555, 410) → right on "Wikipedia" — click!
-→ Wikipedia page loaded successfully
+# 1. Found "621" text at (957, 621) via UI automation. Star icon is just left of it.
+# 2. Capture with rulers:
+capture_region_around(x=935, y=630, radius=60, ruler_tick_interval=25)
+# → Rulers show star icon at x=937, y=622 — read directly from grid
+# 3. Click:
+click_screen(x=937, y=622)
+# → Star toggled to filled/favorited on first attempt!
+```
+
+**Fallback: marker-based refinement (when rulers aren't enough):**
+
+If you need to verify an exact coordinate before clicking (e.g., very small targets or
+overlapping elements), add `mark_center=true` to draw a red circle at your estimated point:
+
+```
+capture_region_around(
+    x=937, y=622,
+    radius=60,
+    mark_center=true,       # red circle at the estimated coordinates
+    show_rulers=true,       # rulers still visible for adjustment
+    ruler_tick_interval=25,
+    image_format="webp", quality=70
+)
+# → If marker is on target: click. If off: read correct coords from rulers and adjust.
 ```
 
 **Why this matters:** Not every interactive element appears in the UI automation tree (especially
-web content in Chromium browsers). This feedback loop gives the agent a reliable way to target
+web content in Chromium browsers). The ruler-based approach gives the agent a reliable way to target
 *any* coordinate on screen using only vision — whether to click, type, drag, or scroll. It's
-the universal fallback for any coordinate-based interaction.
+the universal fallback for any coordinate-based interaction, typically completing in 1-2 steps
+instead of the 5-6 iterations needed with pure marker-based guessing.
 
 ---
 

@@ -1898,6 +1898,106 @@ def get_cursor_position() -> str:
         return f"Error getting cursor position: {str(e)}"
 
 
+def _draw_coordinate_rulers(image, left: int, top: int, tick_interval: int = 50):
+    """Draw coordinate rulers on all 4 edges showing real screen coordinates.
+
+    Args:
+        image: PIL Image to draw on (modified in place).
+        left: Real screen X of the image's left edge.
+        top: Real screen Y of the image's top edge.
+        tick_interval: Pixels between tick marks (in screen coordinates). Default 50.
+
+    Returns:
+        New PIL Image with rulers added (slightly larger than input).
+    """
+    from PIL import ImageDraw, ImageFont
+    import os
+
+    img_w, img_h = image.size
+    ruler_thickness = 22  # pixels for ruler bar
+    font_size = 11
+
+    # Try to load a small font
+    font = None
+    try:
+        font_path = os.path.join(os.path.dirname(__file__), "FZYTK.TTF")
+        if os.path.isfile(font_path):
+            font = ImageFont.truetype(font_path, font_size)
+    except Exception:
+        pass
+    if font is None:
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except Exception:
+            try:
+                font = ImageFont.load_default()
+            except Exception:
+                font = None
+
+    # Create new image with space for rulers (top and left)
+    new_w = img_w + ruler_thickness
+    new_h = img_h + ruler_thickness
+    canvas = PILImage.new("RGB", (new_w, new_h), (240, 240, 240))
+
+    # Paste original image offset by ruler thickness
+    canvas.paste(image, (ruler_thickness, ruler_thickness))
+
+    draw = ImageDraw.Draw(canvas)
+
+    # Draw ruler backgrounds
+    draw.rectangle([0, 0, ruler_thickness - 1, new_h], fill=(220, 220, 220))  # left ruler
+    draw.rectangle([0, 0, new_w, ruler_thickness - 1], fill=(220, 220, 220))  # top ruler
+
+    # Draw border lines between ruler and image
+    draw.line([(ruler_thickness, 0), (ruler_thickness, new_h)], fill=(160, 160, 160), width=1)
+    draw.line([(0, ruler_thickness), (new_w, ruler_thickness)], fill=(160, 160, 160), width=1)
+
+    # Compute first tick position aligned to tick_interval
+    first_tick_x = ((left // tick_interval) + 1) * tick_interval
+    first_tick_y = ((top // tick_interval) + 1) * tick_interval
+
+    right = left + img_w
+    bottom = top + img_h
+
+    # Draw horizontal ticks (top ruler) — show real screen X coordinates
+    screen_x = first_tick_x
+    while screen_x < right:
+        img_x = (screen_x - left) + ruler_thickness  # position on canvas
+        # Tick mark
+        draw.line([(img_x, ruler_thickness - 6), (img_x, ruler_thickness)], fill=(100, 100, 100), width=1)
+        # Light vertical guide line on image
+        draw.line([(img_x, ruler_thickness), (img_x, new_h)], fill=(200, 200, 200, 80), width=1)
+        # Label
+        label = str(screen_x)
+        if font:
+            bbox = draw.textbbox((0, 0), label, font=font)
+            tw = bbox[2] - bbox[0]
+        else:
+            tw = len(label) * 6
+        draw.text((img_x - tw // 2, 2), label, fill=(60, 60, 60), font=font)
+        screen_x += tick_interval
+
+    # Draw vertical ticks (left ruler) — show real screen Y coordinates
+    screen_y = first_tick_y
+    while screen_y < bottom:
+        img_y = (screen_y - top) + ruler_thickness  # position on canvas
+        # Tick mark
+        draw.line([(ruler_thickness - 6, img_y), (ruler_thickness, img_y)], fill=(100, 100, 100), width=1)
+        # Light horizontal guide line on image
+        draw.line([(ruler_thickness, img_y), (new_w, img_y)], fill=(200, 200, 200, 80), width=1)
+        # Label (rotated would be ideal but keep it simple - just draw horizontally)
+        label = str(screen_y)
+        if font:
+            bbox = draw.textbbox((0, 0), label, font=font)
+            th = bbox[3] - bbox[1]
+        else:
+            th = 10
+        draw.text((1, img_y - th // 2), label, fill=(60, 60, 60), font=font)
+        screen_y += tick_interval
+
+    return canvas
+
+
 @mcp.tool()
 def capture_region_around(
     x: int,
@@ -1905,6 +2005,8 @@ def capture_region_around(
     radius: int = 150,
     mark_center: bool = False,
     marker_radius: int = 15,
+    show_rulers: bool = True,
+    ruler_tick_interval: int = 50,
     image_format: str = "png",
     quality: int = 80,
     color_mode: str = "color",
@@ -1912,15 +2014,11 @@ def capture_region_around(
     """Capture a screen region around the specified coordinates.
 
     Captures a square region of size 2*radius centered on (x, y).
-    Optionally draws a red circle marker at the exact coordinates to help
-    verify if the position is correct before clicking.
+    Optionally draws a red circle marker and/or coordinate rulers showing
+    real screen coordinates along the edges for precise coordinate identification.
 
-    Useful for AI agent coordinate verification:
-    1. Agent estimates coordinates from a full screenshot
-    2. Calls this tool with mark_center=True to see a zoomed-in view with marker
-    3. Adjusts coordinates if marker is off-target
-    4. Repeats until marker is on the desired element
-    5. Clicks the verified coordinates
+    With rulers enabled (default), the agent can read exact screen coordinates
+    directly from the image edges — no scale factor math needed.
 
     Args:
         x: Center X coordinate (absolute screen coordinates)
@@ -1928,6 +2026,8 @@ def capture_region_around(
         radius: Half-size of capture region in pixels (default 150, captures 300x300 area)
         mark_center: If True, draw a red circle at (x, y) on the captured image
         marker_radius: Radius of the red circle marker in screen pixels (default 15)
+        show_rulers: If True (default), draw coordinate rulers on edges showing real screen coordinates
+        ruler_tick_interval: Pixels between ruler tick marks (default 50). Use 25 for dense, 100 for sparse.
         image_format: Output format - "png", "webp", or "jpeg"
         quality: Compression quality 1-100 for webp/jpeg
         color_mode: "color", "grayscale", or "bw"
@@ -1972,6 +2072,10 @@ def capture_region_around(
                 fill="red",
             )
 
+        # Add coordinate rulers if requested
+        if show_rulers:
+            screenshot = _draw_coordinate_rulers(screenshot, left, top, ruler_tick_interval)
+
         # Prescale for agent consumption
         orig_w, orig_h = screenshot.size
         screenshot, scale_factor = _prescale_for_agent(screenshot)
@@ -1988,12 +2092,19 @@ def capture_region_around(
         image = Image(data=img_bytes, format=fmt)
 
         info = (
-            f"Captured {orig_w}x{orig_h} region around ({x}, {y}) "
+            f"Captured {width}x{height} region around ({x}, {y}) "
             f"(screen area: [{left}, {top}] to [{right}, {bottom}]). "
-            f"Prescaled to {scaled_w}x{scaled_h} (factor {scale_factor:.4f}x)."
         )
+        if show_rulers:
+            info += (
+                f"Coordinate rulers show real screen coordinates on edges. "
+                f"Read coordinates directly from rulers — no math needed. "
+            )
+        else:
+            info += f"Prescaled to {scaled_w}x{scaled_h} (factor {scale_factor:.4f}x). "
+
         if mark_center:
-            info += f" Red circle marker drawn at ({x}, {y})."
+            info += f"Red circle marker drawn at ({x}, {y})."
 
         return [info, image]
 
