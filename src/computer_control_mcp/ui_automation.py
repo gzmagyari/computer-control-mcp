@@ -650,7 +650,12 @@ def _collect_atspi_elements(node, depth: int = 0, max_depth: int = 40) -> List[D
         ti = node.get_text_iface()
         if ti:
             cc = ti.get_character_count()
-            text = ti.get_text(0, min(cc, 1000))
+            try:
+                text = ti.get_text(0, min(cc, 1000))
+            except TypeError:
+                # gi bindings: use Atspi.Text.get_text(node, start, end)
+                from gi.repository import Atspi as _Atspi
+                text = _Atspi.Text.get_text(node, 0, min(cc, 1000))
     except Exception:
         pass
 
@@ -787,8 +792,25 @@ def _get_ui_elements_linux(app_filter: Optional[str] = None) -> Dict:
                 continue
 
             # Skip apps that don't match the filter
-            if app_filter_lower and app_filter_lower not in app_name.lower():
-                continue
+            if app_filter_lower:
+                match = app_filter_lower in app_name.lower()
+                # Also check child frame names (AT-SPI app name differs from window title)
+                if not match:
+                    try:
+                        for j in range(min(app.get_child_count(), 10)):
+                            ch = app.get_child_at_index(j)
+                            if ch:
+                                frame_name = (ch.get_name() or "").lower()
+                                if app_filter_lower in frame_name:
+                                    match = True
+                                    break
+                    except Exception:
+                        pass
+                # Reverse match: app name in filter (e.g. "thunar" in "workspace - thunar")
+                if not match:
+                    match = app_name.lower() in app_filter_lower
+                if not match:
+                    continue
 
             elements = _collect_atspi_elements(app)
             total_before += len(elements)
@@ -990,7 +1012,11 @@ def _atspi_text_value_snapshot(node, max_chars: int = 2000) -> Dict[str, Any]:
         ti = node.get_text_iface()
         if ti:
             count = ti.get_character_count()
-            result["text"] = ti.get_text(0, min(count, max_chars))
+            try:
+                result["text"] = ti.get_text(0, min(count, max_chars))
+            except TypeError:
+                from gi.repository import Atspi as _Atspi
+                result["text"] = _Atspi.Text.get_text(node, 0, min(count, max_chars))
     except Exception:
         pass
     try:
@@ -1347,8 +1373,28 @@ def _get_deep_ui_elements_linux(
             except Exception:
                 continue
 
-            if app_filter_lower and app_filter_lower not in _sanitize_match_text(app_name):
-                continue
+            if app_filter_lower:
+                # Match against AT-SPI app name
+                match = app_filter_lower in _sanitize_match_text(app_name)
+                # Also match against child frame/window names (AT-SPI app names
+                # often differ from X11 window titles, e.g. "thunar" vs "workspace - Thunar")
+                if not match:
+                    try:
+                        for j in range(min(app.get_child_count(), 10)):
+                            ch = app.get_child_at_index(j)
+                            if ch:
+                                frame_name = _sanitize_match_text(ch.get_name() or "")
+                                if app_filter_lower in frame_name:
+                                    match = True
+                                    break
+                    except Exception:
+                        pass
+                # Also try reverse: check if the app name is in the filter
+                # (handles "Thunar" matching app "thunar")
+                if not match:
+                    match = _sanitize_match_text(app_name) in app_filter_lower
+                if not match:
+                    continue
 
             elements = _collect_atspi_elements_deep(
                 app,
@@ -2272,7 +2318,16 @@ def _perform_uia_text_action(control, action: str, **kwargs) -> Dict[str, Any]:
 
 
 def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
-    """Perform text pattern operations on an AT-SPI node."""
+    """Perform text pattern operations on an AT-SPI node.
+
+    Note: In gi/pyatspi2 bindings, get_text_iface() returns the Accessible itself.
+    Methods like get_text(start, end) conflict with Accessible.get_text() (returns Text iface).
+    We use Atspi.Text.method(node, ...) form to call Text interface methods unambiguously.
+    """
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi as _Atspi
+
     try:
         ti = node.get_text_iface()
         if not ti:
@@ -2280,17 +2335,20 @@ def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
     except Exception:
         return {"success": False, "error": "Text interface not available on this element"}
 
+    # Use Atspi.Text.* static methods to avoid Accessible.get_text() ambiguity
+    T = _Atspi.Text
+
     try:
-        char_count = ti.get_character_count()
+        char_count = T.get_character_count(node)
 
         if action == "get_selection":
-            n_sel = ti.get_n_selections()
+            n_sel = T.get_n_selections(node)
             selections = []
             for i in range(n_sel):
-                r = ti.get_selection(i)
+                r = T.get_selection(node, i)
                 if r:
                     s, e = r.start_offset, r.end_offset
-                    txt = ti.get_text(s, e)
+                    txt = T.get_text(node, s, e)
                     selections.append({"start": s, "end": e, "text": txt or ""})
             return {"success": True, "selections": selections, "count": len(selections)}
 
@@ -2302,13 +2360,13 @@ def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
                 return {"success": False, "error": "start must be <= end"}
             end = min(end, char_count)
             # Remove existing selections
-            for i in range(ti.get_n_selections() - 1, -1, -1):
+            for i in range(T.get_n_selections(node) - 1, -1, -1):
                 try:
-                    ti.remove_selection(i)
+                    T.remove_selection(node, i)
                 except Exception:
                     pass
-            ok = ti.add_selection(start, end)
-            txt = ti.get_text(start, end) if ok else ""
+            ok = T.add_selection(node, start, end)
+            txt = T.get_text(node, start, end) if ok else ""
             return {"success": bool(ok), "message": f"Selected text range [{start}:{end}]",
                     "start": start, "end": end, "text": txt or ""}
 
@@ -2316,29 +2374,29 @@ def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
             search_text = kwargs.get("search_text", "")
             if not search_text:
                 return {"success": False, "error": "search_text is required"}
-            full = ti.get_text(0, char_count) or ""
+            full = T.get_text(node, 0, char_count) or ""
             idx = full.find(search_text)
             if idx < 0:
                 return {"success": False, "error": f"Text not found: '{search_text}'"}
             # Remove existing selections
-            for i in range(ti.get_n_selections() - 1, -1, -1):
+            for i in range(T.get_n_selections(node) - 1, -1, -1):
                 try:
-                    ti.remove_selection(i)
+                    T.remove_selection(node, i)
                 except Exception:
                     pass
-            ok = ti.add_selection(idx, idx + len(search_text))
+            ok = T.add_selection(node, idx, idx + len(search_text))
             return {"success": bool(ok), "message": "Found and selected text",
                     "text": search_text, "start": idx, "end": idx + len(search_text)}
 
         if action == "get_caret":
-            offset = ti.get_caret_offset()
+            offset = T.get_caret_offset(node)
             return {"success": True, "offset": offset, "text_length": char_count}
 
         if action == "set_caret":
             offset = kwargs.get("offset", 0)
             if offset < 0:
                 return {"success": False, "error": "offset must be non-negative"}
-            ok = ti.set_caret_offset(min(offset, char_count))
+            ok = T.set_caret_offset(node, min(offset, char_count))
             return {"success": bool(ok), "offset": offset,
                     "message": f"Caret moved to offset {offset}"}
 
@@ -2347,9 +2405,6 @@ def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
             unit = kwargs.get("unit", "word")
             if unit not in _VALID_TEXT_UNITS:
                 return {"success": False, "error": f"Invalid unit '{unit}'. Use: {', '.join(sorted(_VALID_TEXT_UNITS))}"}
-            import gi
-            gi.require_version("Atspi", "2.0")
-            from gi.repository import Atspi as _Atspi
             granularity_map = {
                 "char": _Atspi.TextGranularity.CHAR,
                 "word": _Atspi.TextGranularity.WORD,
@@ -2358,7 +2413,7 @@ def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
                 "sentence": _Atspi.TextGranularity.SENTENCE,
             }
             try:
-                result = ti.get_string_at_offset(offset, granularity_map[unit])
+                result = T.get_string_at_offset(node, offset, granularity_map[unit])
                 return {"success": True, "text": result.content or "",
                         "start": result.start_offset, "end": result.end_offset, "unit": unit}
             except Exception:
@@ -2370,7 +2425,7 @@ def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
                     "paragraph": _Atspi.TextBoundaryType.LINE_START,
                     "sentence": _Atspi.TextBoundaryType.SENTENCE_START,
                 }
-                result = ti.get_text_at_offset(offset, boundary_map[unit])
+                result = T.get_text_at_offset(node, offset, boundary_map[unit])
                 return {"success": True, "text": result.content or "",
                         "start": result.start_offset, "end": result.end_offset, "unit": unit}
 
@@ -2379,12 +2434,9 @@ def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
             if start < 0 or end < 0 or start > end:
                 return {"success": False, "error": "Invalid start/end range"}
             end = min(end, char_count)
-            import gi
-            gi.require_version("Atspi", "2.0")
-            from gi.repository import Atspi as _Atspi
             # Try get_range_extents first (single bounding box for entire range)
             try:
-                rect = ti.get_range_extents(start, end, _Atspi.CoordType.SCREEN)
+                rect = T.get_range_extents(node, start, end, _Atspi.CoordType.SCREEN)
                 if rect and rect.width > 0 and rect.height > 0:
                     return {"success": True, "bounds": [{
                         "x": rect.x, "y": rect.y,
@@ -2397,7 +2449,7 @@ def _perform_atspi_text_action(node, action: str, **kwargs) -> Dict[str, Any]:
             current_line = None
             for i in range(start, min(end, start + 500)):  # cap to avoid huge loops
                 try:
-                    ext = ti.get_character_extents(i, _Atspi.CoordType.SCREEN)
+                    ext = T.get_character_extents(node, i, _Atspi.CoordType.SCREEN)
                     if ext.width <= 0 and ext.height <= 0:
                         continue
                     # Merge rects on same line (similar y position)
@@ -2643,6 +2695,10 @@ def _perform_uia_advanced_action(control, action: str, **kwargs) -> Dict[str, An
 
 def _perform_atspi_advanced_action(node, action: str, **kwargs) -> Dict[str, Any]:
     """Perform advanced AT-SPI operations (table, scroll, hyperlinks)."""
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi as _Atspi
+
     try:
         # ── Table ──
         if action == "get_table_data":
@@ -2748,19 +2804,71 @@ def _perform_atspi_advanced_action(node, action: str, **kwargs) -> Dict[str, Any
             for i in range(min(n_links, kwargs.get("max_links", 100))):
                 try:
                     link = ht.get_link(i)
-                    if link:
-                        name = link.get_name() or ""
-                        uri = ""
+                    if not link:
+                        continue
+                    uri = ""
+                    try:
+                        uri = link.get_uri(0) or ""
+                    except Exception:
+                        pass
+                    start = link.get_start_index()
+                    end = link.get_end_index()
+                    # Get name from the link's anchor accessible object
+                    name = ""
+                    try:
+                        obj = link.get_object(0)
+                        if obj:
+                            name = obj.get_name() or ""
+                    except Exception:
+                        pass
+                    # If no name, try reading text from parent at the link's range
+                    if not name:
                         try:
-                            uri = link.get_uri(0) or ""
+                            name = _Atspi.Text.get_text(node, start, end) or ""
                         except Exception:
                             pass
-                        start = link.get_start_index()
-                        end = link.get_end_index()
-                        links.append({"index": i, "name": name, "uri": uri,
-                                      "start_offset": start, "end_offset": end})
+                    links.append({"index": i, "name": name, "uri": uri,
+                                  "start_offset": start, "end_offset": end})
                 except Exception:
                     continue
+            # If element itself is a link with 0 child links, return its own info
+            if n_links == 0:
+                role = ""
+                try:
+                    role = node.get_role_name()
+                except Exception:
+                    pass
+                if role == "link":
+                    name = ""
+                    try:
+                        name = node.get_name() or ""
+                    except Exception:
+                        pass
+                    # Try to get URI from the element's action interface
+                    uri = ""
+                    try:
+                        ai = node.get_action_iface()
+                        if ai:
+                            for j in range(ai.get_n_actions()):
+                                desc = ai.get_key_binding(j) or ""
+                                if desc:
+                                    uri = desc
+                                    break
+                    except Exception:
+                        pass
+                    # Try component for bounds
+                    bounds = {}
+                    try:
+                        comp = node.get_component_iface()
+                        if comp:
+                            pos = comp.get_position(_Atspi.CoordType.SCREEN)
+                            sz = comp.get_size()
+                            bounds = {"x": pos.x, "y": pos.y, "width": sz.x, "height": sz.y}
+                    except Exception:
+                        pass
+                    links = [{"index": 0, "name": name, "uri": uri,
+                              "self_link": True, **bounds}]
+                    n_links = 1
             return {"success": True, "link_count": n_links, "links": links}
 
         if action == "activate_hyperlink":
@@ -2771,12 +2879,37 @@ def _perform_atspi_advanced_action(node, action: str, **kwargs) -> Dict[str, Any
             link = ht.get_link(link_index)
             if not link:
                 return {"success": False, "error": f"Hyperlink at index {link_index} not found"}
-            # Hyperlink extends Accessible, try action interface
-            ai = link.get_action_iface()
-            if ai and ai.get_n_actions() > 0:
-                ok = ai.do_action(0)
-                return {"success": bool(ok), "message": f"Activated hyperlink {link_index}"}
-            return {"success": False, "error": "Hyperlink has no activatable action"}
+            # Hyperlink.get_object(anchor) returns the Accessible for that anchor
+            # The Accessible may have an action interface we can invoke
+            try:
+                n_anchors = link.get_n_anchors()
+                for anchor in range(n_anchors):
+                    obj = link.get_object(anchor)
+                    if obj:
+                        ai = obj.get_action_iface()
+                        if ai and ai.get_n_actions() > 0:
+                            ok = ai.do_action(0)
+                            return {"success": bool(ok),
+                                    "message": f"Activated hyperlink {link_index} via anchor {anchor}"}
+            except Exception:
+                pass
+            # Fallback: try clicking the link's accessible object at anchor 0
+            try:
+                obj = link.get_object(0)
+                if obj:
+                    comp = obj.get_component_iface()
+                    if comp:
+                        pos = comp.get_position(_Atspi.CoordType.SCREEN)
+                        size = comp.get_size()
+                        cx = pos.x + size.x // 2 if hasattr(size, 'x') else pos.x + 5
+                        cy = pos.y + size.y // 2 if hasattr(size, 'y') else pos.y + 5
+                        import pyautogui
+                        pyautogui.click(cx, cy)
+                        return {"success": True,
+                                "message": f"Activated hyperlink {link_index} via click at ({cx}, {cy})"}
+            except Exception:
+                pass
+            return {"success": False, "error": "Hyperlink has no activatable action or clickable object"}
 
         return {"success": False, "error": f"Unsupported AT-SPI advanced action: {action}"}
     except Exception as e:

@@ -778,18 +778,19 @@ def _set_clipboard(text: str) -> None:
             if process.returncode != 0:
                 raise RuntimeError(f"PowerShell clipboard failed: {process.stderr}")
         else:
-            # Linux: try xclip first, fall back to xsel
+            # Linux: try xsel first (more reliable — doesn't hang without clipboard manager),
+            # fall back to xclip
             try:
                 subprocess.run(
-                    ["xclip", "-selection", "clipboard"],
+                    ["xsel", "--clipboard", "--input"],
                     input=text.encode("utf-8"),
                     capture_output=True,
                     timeout=5,
                     check=True,
                 )
-            except (FileNotFoundError, subprocess.CalledProcessError):
+            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 subprocess.run(
-                    ["xsel", "--clipboard", "--input"],
+                    ["xclip", "-selection", "clipboard"],
                     input=text.encode("utf-8"),
                     capture_output=True,
                     timeout=5,
@@ -826,18 +827,19 @@ def _get_clipboard() -> str:
                 raise RuntimeError(f"PowerShell clipboard failed: {process.stderr}")
             return process.stdout.decode("utf-8", errors="replace")
         else:
-            # Linux: try xclip first, fall back to xsel
+            # Linux: try xsel first (more reliable — doesn't hang without clipboard manager),
+            # fall back to xclip
             try:
                 result = subprocess.run(
-                    ["xclip", "-selection", "clipboard", "-o"],
+                    ["xsel", "--clipboard", "--output"],
                     capture_output=True,
                     timeout=5,
                     check=True,
                 )
                 return result.stdout.decode("utf-8", errors="replace")
-            except (FileNotFoundError, subprocess.CalledProcessError):
+            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 result = subprocess.run(
-                    ["xsel", "--clipboard", "--output"],
+                    ["xclip", "-selection", "clipboard", "-o"],
                     capture_output=True,
                     timeout=5,
                     check=True,
