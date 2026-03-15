@@ -2658,17 +2658,23 @@ def kill_process(
                 os.kill(pid, sig)
                 return json.dumps({"killed": True, "details": f"Sent {'SIGKILL' if force else 'SIGTERM'} to PID {pid}"})
             elif process_name:
-                cmd = ["killall"]
-                if force:
-                    cmd.append("-9")
-                cmd.append(process_name)
-                result = subprocess.run(cmd, capture_output=True, timeout=10)
-                output = (result.stdout.decode("utf-8", errors="replace") +
-                          result.stderr.decode("utf-8", errors="replace")).strip()
-                return json.dumps({
-                    "killed": result.returncode == 0,
-                    "details": output or f"killall {process_name}",
-                })
+                # Try pkill first (more portable), fall back to killall
+                for kill_cmd in ["pkill", "killall"]:
+                    try:
+                        cmd = [kill_cmd]
+                        if force:
+                            cmd.append("-9")
+                        cmd.append(process_name)
+                        result = subprocess.run(cmd, capture_output=True, timeout=10)
+                        output = (result.stdout.decode("utf-8", errors="replace") +
+                                  result.stderr.decode("utf-8", errors="replace")).strip()
+                        return json.dumps({
+                            "killed": result.returncode == 0,
+                            "details": output or f"{kill_cmd} {process_name}",
+                        })
+                    except FileNotFoundError:
+                        continue
+                return json.dumps({"killed": False, "details": f"Neither pkill nor killall available"})
     except ProcessLookupError:
         return json.dumps({"killed": False, "details": f"Process not found: {pid or process_name}"})
     except PermissionError:

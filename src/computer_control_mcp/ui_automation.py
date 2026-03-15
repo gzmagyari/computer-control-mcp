@@ -2748,22 +2748,44 @@ def _perform_atspi_advanced_action(node, action: str, **kwargs) -> Dict[str, Any
 
         # ── Scroll ──
         if action == "scroll_container":
-            import gi
-            gi.require_version("Atspi", "2.0")
-            from gi.repository import Atspi as _Atspi
+            direction = kwargs.get("direction", "down")
+            amount = kwargs.get("amount", 1)
+            unit = kwargs.get("unit", "page")
+
+            # AT-SPI scroll_to only scrolls element to edges, not the container by amount.
+            # Use mouse wheel at element center for reliable container scrolling.
+            import pyautogui
             comp = node.get_component_iface()
             if not comp:
                 return {"success": False, "error": "Component interface not available for scrolling"}
-            direction = kwargs.get("direction", "down")
-            scroll_map = {
-                "up": _Atspi.ScrollType.TOP_EDGE,
-                "down": _Atspi.ScrollType.BOTTOM_EDGE,
-                "left": _Atspi.ScrollType.LEFT_EDGE,
-                "right": _Atspi.ScrollType.RIGHT_EDGE,
-            }
-            scroll_type = scroll_map.get(direction, _Atspi.ScrollType.ANYWHERE)
-            ok = comp.scroll_to(scroll_type)
-            return {"success": bool(ok), "message": f"Scrolled {direction}"}
+            try:
+                pos = comp.get_position(_Atspi.CoordType.SCREEN)
+                size = comp.get_size()
+                cx = pos.x + size.x // 2
+                cy = pos.y + size.y // 2
+            except Exception:
+                return {"success": False, "error": "Could not determine element position for scrolling"}
+
+            # Calculate scroll clicks: page=5 clicks, line=1 click, percent=amount/10
+            if unit == "page":
+                clicks = 5 * amount
+            elif unit == "line":
+                clicks = amount
+            elif unit == "percent":
+                clicks = max(1, amount // 10)
+            else:
+                clicks = 3 * amount
+
+            if direction == "up":
+                pyautogui.scroll(clicks, x=cx, y=cy)
+            elif direction == "down":
+                pyautogui.scroll(-clicks, x=cx, y=cy)
+            elif direction == "left":
+                pyautogui.hscroll(-clicks, x=cx, y=cy)
+            elif direction == "right":
+                pyautogui.hscroll(clicks, x=cx, y=cy)
+
+            return {"success": True, "message": f"Scrolled {direction} by {amount} {unit}(s) at ({cx},{cy})"}
 
         if action == "get_scroll_info":
             # AT-SPI doesn't have a direct scroll info interface like UIA
